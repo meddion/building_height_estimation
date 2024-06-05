@@ -1,5 +1,7 @@
 import os
+import cv2
 import json
+import numpy as np
 from torchvision.io import read_image
 from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
@@ -64,24 +66,27 @@ class BuildingDataset(torch.utils.data.Dataset):
 
         try:
             img_stem, img_type = self.image_names[idx].split(".", 1)
-
-            building_heights = []
-            with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
-                annot = json.load(f)
-                for shape in annot["shapes"]:
-                    building_heights.append(shape["group_id"])
-
             img = read_image((self.root_dir / self.image_names[idx]))
             img = tv_tensors.Image(img)
 
-            mask = read_image(
-                self.root_dir / (img_stem + MASK_POSTFIX + "." + img_type)
-            )
-            masks = convert_to_binary_masks(mask)
+            building_heights = []
+            masks = []
+            with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
+                annot = json.load(f)
+                for shape in annot["shapes"]:
+                    mask = torch.zeros_like(img[0, :, :]).to(torch.uint8).numpy()
+                    points = np.array(shape["points"], dtype=np.int32)
+                    cv2.fillPoly(mask, [points], (255, 0, 0))
+                    mask = torch.tensor(mask)
+                    masks.append(mask)
+                    building_heights.append(shape["group_id"])
 
             # Get bounding box coordinates for each mask
+            masks = torch.stack(masks, dim=0)
             bboxes = masks_to_boxes(masks)
             area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+
+            masks = tv_tensors.Mask(masks)
 
             assert not torch.any(area < 1e-6), "Bounding box area must be positive"
             assert bboxes.min() >= 0, "Bounding box values must be positive"
@@ -102,9 +107,10 @@ class BuildingDataset(torch.utils.data.Dataset):
             target = {
                 "boxes": bboxes,  # A bbox around each building.
                 "labels": labels,
-                "masks": tv_tensors.Mask(masks),
+                "masks": masks,
                 "building_heights": torch.tensor(building_heights),
                 "image_id": idx,
+                "image_name": self.image_names[idx],
                 "area": area,
                 # TODO: remove this after the eval function no longer depends on this field
                 "iscrowd": torch.zeros(len(labels), dtype=torch.int64),
@@ -121,7 +127,7 @@ class BuildingDataset(torch.utils.data.Dataset):
             self._delete_image_names.append(self.image_names[idx])
             del self.image_names[idx]
 
-            return self.__getitem__(idx)
+        return self.__getitem__(idx)
 
     """
     TODO: 
