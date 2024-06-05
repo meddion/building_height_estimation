@@ -1,7 +1,0 @@
-__ignore__
-_background_
-building_class_1
-building_class_2
-building_class_3
-building_class_4
-building_class_5

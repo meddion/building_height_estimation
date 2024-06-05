@@ -14,7 +14,8 @@ def get_model_instance_segmentation(num_classes):
     # Load an instance segmentation model pre-trained on COCO
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
 
-    # Get number of input features for the classifier
+    # Get number of input features for the classifier.
+    # This is a size of features that we get from the backbone.
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     # replace the pre-trained head with a new one
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -42,20 +43,16 @@ def get_transform(train):
     return T.Compose(transforms)
 
 
-if __name__ == "__main__":
+def train():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     dataset = BuildingDataset(
-        "datasets/mlc_training_data/images/",
-        "datasets/mlc_training_data/ground_truth_files/",
-        "datasets/mlc_training_data/masks/SegmentationClass/",
+        "datasets/mlc_training_data/images_annotated/",
         transforms=get_transform(train=True),
     )
 
     dataset_test = BuildingDataset(
-        "datasets/mlc_training_data/images/",
-        "datasets/mlc_training_data/ground_truth_files/",
-        "datasets/mlc_training_data/masks/SegmentationClass/",
+        "datasets/mlc_training_data/images_annotated/",
         transforms=get_transform(train=False),
     )
 
@@ -100,3 +97,7 @@ if __name__ == "__main__":
         lr_scheduler.step()
         # Evaluate on the test dataset
         evaluate(model, data_loader_test, device=device)
+
+
+if __name__ == "__main__":
+    train()
