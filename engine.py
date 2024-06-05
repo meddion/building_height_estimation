@@ -10,12 +10,12 @@ from coco_utils import get_coco_api_from_dataset
 
 
 def train_one_epoch(
-    model, optimizer, data_loader, device, epoch, print_freq, scaler=None
-):
+    model, optimizer, data_loader, device, epoch, num_epochs, print_freq, scaler=None
+) -> tuple[utils.MetricLogger, torch.float]:
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-    header = f"Epoch: [{epoch}]"
+    header = f"Epoch: [{epoch}] / [{num_epochs-1}]"
 
     lr_scheduler = None
     if epoch == 0:
@@ -28,6 +28,7 @@ def train_one_epoch(
             optimizer, start_factor=warmup_factor, total_iters=warmup_iters
         )
 
+    loss_value = torch.finfo(torch.float).max
     for images, targets in metric_logger.log_every(data_loader, print_freq, header):
         images = list(image.to(device) for image in images)
         targets = [
@@ -67,7 +68,7 @@ def train_one_epoch(
         metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    return metric_logger
+    return metric_logger, loss_value
 
 
 def _get_iou_types(model):
@@ -86,7 +87,7 @@ def _get_iou_types(model):
 def evaluate(model, data_loader, device):
     n_threads = torch.get_num_threads()
     # FIXME remove this and make paste_masks_in_image run on the GPU
-    torch.set_num_threads(1)
+    torch.set_num_threads(n_threads)
     cpu_device = torch.device("cpu")
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")

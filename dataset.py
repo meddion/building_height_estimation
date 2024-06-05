@@ -106,6 +106,8 @@ class BuildingDataset(torch.utils.data.Dataset):
                 "building_heights": torch.tensor(building_heights),
                 "image_id": idx,
                 "area": area,
+                # TODO: remove this after the eval function no longer depends on this field
+                "iscrowd": torch.zeros(len(labels), dtype=torch.int64),
             }
 
             if self.transforms is not None:
@@ -118,6 +120,7 @@ class BuildingDataset(torch.utils.data.Dataset):
             )
             self._delete_image_names.append(self.image_names[idx])
             del self.image_names[idx]
+
             return self.__getitem__(idx)
 
     """

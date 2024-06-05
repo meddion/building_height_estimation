@@ -1,5 +1,6 @@
 .vscode
 scripts
+checkpoints
 scartch.ipynb
 __pycache__
 .venv
