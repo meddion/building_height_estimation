@@ -13,6 +13,8 @@ from random import randint
 
 root_dir = "./datasets/mlc_training_data/images_annotated"
 
+mask_annotations = {}
+
 
 def gen_mask_img(json_filename):
     # read json file
@@ -33,7 +35,12 @@ def gen_mask_img(json_filename):
     # create a blank image
     mask = np.zeros_like(image, dtype=np.uint8)
 
+    img_id = data["imagePath"]
+
+        mask_annotations[img_id] = {}
     for j, shape in enumerate(data["shapes"]):
+        building_height = shape["group_id"]
+
         points = np.array(
             shape["points"], dtype=np.int32
         )  # tips: points location must be int32
