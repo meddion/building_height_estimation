@@ -17,7 +17,7 @@ from engine import train_one_epoch, evaluate
 logging.basicConfig(level=logging.INFO)
 
 CHECKPOINT_DIR = Path("checkpoints")
-CHECKPOINT_PRUNE_THRESHOLD = 3  # No more than N checkpoints to keep.
+CHECKPOINT_PRUNE_THRESHOLD = 3  # No more than N latest checkpoints to keep.
 NUMBER_OF_EPOCHS_DEFAULT = 10
 TRAIN_BATCH_SIZE = 3
 TEST_BATCH_SIZE = 1
@@ -176,7 +176,6 @@ def train():
         evaluate(model, data_loader_test, device=device)
 
         logging.debug(f"Saving model parameters on {epoch} with loss {latest_loss}")
-        prune_old_checkpoints(CHECKPOINT_PRUNE_THRESHOLD)
         torch.save(
             {
                 "epoch": epoch,
@@ -187,8 +186,10 @@ def train():
             },
             epoch_checkpoint_filepath(epoch),
         )
+        prune_old_checkpoints(CHECKPOINT_PRUNE_THRESHOLD)
 
 
+# TODO: impl proper evaluation
 @torch.inference_mode()
 def evaluate(model, data_loader, device):
     n_threads = torch.get_num_threads()
