@@ -5,6 +5,7 @@ from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
 from torchvision.ops.boxes import masks_to_boxes
 import torch
+import logging
 from pathlib import Path
 
 
@@ -24,6 +25,15 @@ MASK_POSTFIX = "_mask"
 
 NUMBER_OF_CLASSES = 2
 
+# These images were found to have bounding boxes that are too small.
+IGNORE_IMG_LIST = [
+    "bjnwymswty",
+    "dayurbqhuw",
+    "kqavrcwooa",
+    "seypojukdk",
+    "zsmmztbbul",
+]
+
 
 class BuildingDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir: str, transforms=None) -> None:
@@ -36,63 +46,79 @@ class BuildingDataset(torch.utils.data.Dataset):
                 img.stem + img.suffix
                 for ext in extensions
                 for img in self.root_dir.glob(ext)
-                if MASK_POSTFIX not in img.stem
+                if MASK_POSTFIX not in img.stem and img.stem not in IGNORE_IMG_LIST
             ]
         )
         assert len(self.image_names) > 0, "No images found in the dataset path"
 
         self.transforms = transforms
 
+        self._delete_image_names = []
+
     def __len__(self):
         return len(self.image_names)
 
     def __getitem__(self, idx):
-        img_stem, img_type = self.image_names[idx].split(".", 1)
+        if idx >= len(self.image_names):
+            raise StopIteration
 
-        building_heights = []
-        with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
-            annot = json.load(f)
-            for shape in annot["shapes"]:
-                building_heights.append(shape["group_id"])
+        try:
+            img_stem, img_type = self.image_names[idx].split(".", 1)
 
-        img = read_image((self.root_dir / self.image_names[idx]))
-        img = tv_tensors.Image(img)
+            building_heights = []
+            with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
+                annot = json.load(f)
+                for shape in annot["shapes"]:
+                    building_heights.append(shape["group_id"])
 
-        mask = read_image(self.root_dir / (img_stem + MASK_POSTFIX + "." + img_type))
-        masks = convert_to_binary_masks(mask)
+            img = read_image((self.root_dir / self.image_names[idx]))
+            img = tv_tensors.Image(img)
 
-        # Get bounding box coordinates for each mask
-        bboxes = masks_to_boxes(masks)
-        area = (bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0])
+            mask = read_image(
+                self.root_dir / (img_stem + MASK_POSTFIX + "." + img_type)
+            )
+            masks = convert_to_binary_masks(mask)
 
-        # There is only one class on masks, a building.
-        # 1 - for building, 0 - for background
-        labels = torch.ones(masks.shape[0], dtype=torch.int64)
+            # Get bounding box coordinates for each mask
+            bboxes = masks_to_boxes(masks)
+            area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
 
-        assert bboxes.min() >= 0, "Bounding box values must be positive"
-        bboxes = tv_tensors.BoundingBoxes(
-            bboxes,
-            format=tv_tensors.BoundingBoxFormat.XYXY,
-            canvas_size=F.get_size(img),
-        )
+            assert not torch.any(area < 1e-6), "Bounding box area must be positive"
+            assert bboxes.min() >= 0, "Bounding box values must be positive"
+            bboxes = tv_tensors.BoundingBoxes(
+                bboxes,
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=F.get_size(img),
+            )
 
-        assert (
-            len(labels) == len(masks) == len(bboxes)
-        ), f"{len(labels)} (labels) != {len(masks)} (masks) != {len(bboxes)} (bboxes)"
+            # There is only one class on masks, a building.
+            # 1 - for building, 0 - for background
+            labels = torch.ones(masks.shape[0], dtype=torch.int64)
 
-        target = {
-            "boxes": bboxes,  # A bbox around each building.
-            "labels": labels,
-            "masks": tv_tensors.Mask(masks),
-            "building_heights": torch.tensor(building_heights),
-            "image_id": idx,
-            "area": area,
-        }
+            assert (
+                len(labels) == len(masks) == len(bboxes)
+            ), f"{len(labels)} (labels) != {len(masks)} (masks) != {len(bboxes)} (bboxes)"
 
-        if self.transforms is not None:
-            img, target = self.transforms(img, target)
+            target = {
+                "boxes": bboxes,  # A bbox around each building.
+                "labels": labels,
+                "masks": tv_tensors.Mask(masks),
+                "building_heights": torch.tensor(building_heights),
+                "image_id": idx,
+                "area": area,
+            }
 
-        return img, target
+            if self.transforms is not None:
+                img, target = self.transforms(img, target)
+
+            return img, target
+        except Exception as e:
+            logging.warn(
+                f"Got error while processing image {self.image_names[idx]} (idx: {idx}): {e}. Deleting it from the image list and skipping it."
+            )
+            self._delete_image_names.append(self.image_names[idx])
+            del self.image_names[idx]
+            return self.__getitem__(idx)
 
     """
     TODO: 
