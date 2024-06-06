@@ -66,14 +66,33 @@ class CustomRoIHeads(RoIHeads):
             keypoint_head,
             keypoint_predictor,
         )
-        self.value_predictor = value_predictor
+        self.height_predictor = value_predictor
 
     # TODO: impl
-    def value_regression_loss(
-        self, value_regression: Tensor, targets: Tensor
+    def height_regression_loss(
+        self,
+        height_predictions: Tensor,
+        matched_idxs: List[Tensor],
+        labels: List[Tensor],
+        gt_heights: List[Tensor],
     ) -> Tensor:
-        # FIGURE OUT HOW TO MATCH VALUE REGRESSION PREDICTIONS WITH TARGETS TO COMPUTE LOSS
-        height_loss = nn.MSELoss()(value_regression, targets)
+        # TODO: simplify
+        height_proposals = []
+
+        for i, matched_idx in enumerate(matched_idxs):
+            height_proposals.append(gt_heights[i][matched_idx])
+
+        height_proposals = torch.cat(height_proposals)
+        height_labels = torch.cat(labels)
+
+        # Gets proposals ids which contain an object in them for batch 0
+        zero_object_ids = torch.where(height_labels == 0)[0]
+        height_proposals[zero_object_ids] = 0
+        height_proposals = height_proposals.to(height_predictions.dtype)
+
+        # TODO: maybe use different loss
+        height_loss = nn.MSELoss()(height_predictions, height_proposals)
+
         return height_loss
 
     def forward(
@@ -115,7 +134,7 @@ class CustomRoIHeads(RoIHeads):
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        value_regression = self.value_predictor(box_features).squeeze()
+        height_predictions = self.height_predictor(box_features).squeeze()
 
         result: List[Dict[str, torch.Tensor]] = []
         losses = {}
@@ -128,23 +147,11 @@ class CustomRoIHeads(RoIHeads):
                 class_logits, box_regression, labels, regression_targets
             )
 
-            # TODO: simplify
-            proposal_heights = []
-            heights = [t["building_heights"] for t in targets]
-            for i, matched_idx in enumerate(matched_idxs):
-                proposal_heights.append(heights[i][matched_idx])
-
-            proposal_heights = torch.stack(proposal_heights).flatten()
-            height_labels = torch.stack(labels).flatten()
-
-            # Gets proposals ids which contain an object in them for batch 0
-            zero_object_ids = torch.where(height_labels == 0)[0]
-            proposal_heights[zero_object_ids] = 0
-            proposal_heights = proposal_heights.to(value_regression.dtype)
-
-            loss_value_regression = self.value_regression_loss(
-                value_regression,
-                proposal_heights,
+            loss_value_regression = self.height_regression_loss(
+                height_predictions,
+                matched_idxs,
+                labels,
+                [t["building_heights"] for t in targets],
             )
 
             losses = {
@@ -153,6 +160,7 @@ class CustomRoIHeads(RoIHeads):
                 "loss_value_regression": loss_value_regression,
             }
         else:
+            # TODO: add height prediction to results
             boxes, scores, labels = self.postprocess_detections(
                 class_logits, box_regression, proposals, image_shapes
             )
