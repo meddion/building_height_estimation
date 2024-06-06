@@ -10,6 +10,7 @@ from torchvision.models.detection.roi_heads import (
     keypointrcnn_loss,
 )
 from torch import Tensor
+from torch import nn
 from torchvision.models.detection.mask_rcnn import (
     misc_nn_ops,
 )
@@ -69,14 +70,11 @@ class CustomRoIHeads(RoIHeads):
 
     # TODO: impl
     def value_regression_loss(
-        self, value_regression: Tensor, targets: List[Tensor]
+        self, value_regression: Tensor, targets: Tensor
     ) -> Tensor:
         # FIGURE OUT HOW TO MATCH VALUE REGRESSION PREDICTIONS WITH TARGETS TO COMPUTE LOSS
-
-        # height_loss = nn.MSELoss()(value_regression, torch.cat(targets))
-        # return height_loss
-
-        return torch.tensor(9999)
+        height_loss = nn.MSELoss()(value_regression, targets)
+        return height_loss
 
     def forward(
         self,
@@ -117,7 +115,7 @@ class CustomRoIHeads(RoIHeads):
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        value_regression = self.value_predictor(box_features)
+        value_regression = self.value_predictor(box_features).squeeze()
 
         result: List[Dict[str, torch.Tensor]] = []
         losses = {}
@@ -130,9 +128,23 @@ class CustomRoIHeads(RoIHeads):
                 class_logits, box_regression, labels, regression_targets
             )
 
+            # TODO: simplify
+            proposal_heights = []
+            heights = [t["building_heights"] for t in targets]
+            for i, matched_idx in enumerate(matched_idxs):
+                proposal_heights.append(heights[i][matched_idx])
+
+            proposal_heights = torch.stack(proposal_heights).flatten()
+            height_labels = torch.stack(labels).flatten()
+
+            # Gets proposals ids which contain an object in them for batch 0
+            zero_object_ids = torch.where(height_labels == 0)[0]
+            proposal_heights[zero_object_ids] = 0
+            proposal_heights = proposal_heights.to(value_regression.dtype)
+
             loss_value_regression = self.value_regression_loss(
                 value_regression,
-                [t["building_heights"] for t in targets],
+                proposal_heights,
             )
 
             losses = {
