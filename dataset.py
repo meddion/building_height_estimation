@@ -11,18 +11,6 @@ import logging
 from pathlib import Path
 
 
-# Splits the color-encoded mask into a set of binary masks
-def convert_to_binary_masks(mask: torch.Tensor) -> torch.Tensor:
-    R = mask[0, :, :].long()
-    G = mask[1, :, :].long()
-    B = mask[2, :, :].long()
-    mask = 256**2 * R + 256 * G + B
-    obj_ids = mask.unique()
-    obj_ids = obj_ids[1:]
-
-    return (mask == obj_ids[:, None, None]).to(dtype=torch.uint8)
-
-
 MASK_POSTFIX = "_mask"
 
 NUMBER_OF_CLASSES = 2

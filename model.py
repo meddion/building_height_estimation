@@ -1,17 +1,22 @@
 import torch.utils
 import os
 import time
+from torch import nn
 import torch.utils.data
+import torch.nn.functional as F
 import logging
 import re
 from pathlib import Path
 import utils
 from dataset import BuildingDataset, NUMBER_OF_CLASSES
-import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.models.detection.mask_rcnn import (
+    MaskRCNNPredictor,
+)
+import torchvision
 from torchvision.transforms import v2 as T
 from engine import train_one_epoch, evaluate
+from custom_roi_heads import CustomRoIHeads
 
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +29,20 @@ TEST_BATCH_SIZE = 1
 TEST_SPLIT = 0.2
 
 
+class BuildingHeightPredictor(nn.Module):
+    def __init__(self, in_features: int):
+        super().__init__()
+        hiddden_features = in_features // 2
+        self.ln1 = nn.Linear(in_features, hiddden_features)
+        self.ln2 = nn.Linear(hiddden_features, 1)
+
+    def forward(self, x):
+        x = F.relu(self.ln1(x))
+        x = self.ln2(x)
+
+        return x
+
+
 # TODO: learn how roi_heads are linked
 def get_model_instance_segmentation(num_classes):
     # Load an instance segmentation model pre-trained on COCO
@@ -32,16 +51,38 @@ def get_model_instance_segmentation(num_classes):
     # Get number of input features for the classifier.
     # This is a size of features that we get from the backbone.
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    # replace the pre-trained head with a new one
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
-    # Now get the number of input features for the mask classifier
+    # Add a new regression head to predict building height
+    building_height_pred = BuildingHeightPredictor(in_features)
+
+    # Replace the pre-trained head with a new one
+    box_predictor = FastRCNNPredictor(in_features, num_classes)
+    # Get the number of input features for the mask classifier
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
+    # Replace the mask predictor with a new one
+    mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_layer, num_classes)
 
-    # And replace the mask predictor with a new one
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(
-        in_features_mask, hidden_layer, num_classes
+    # Copy all of the params passed to a default RoIHeads
+    model.roi_heads = CustomRoIHeads(
+        building_height_pred,
+        box_roi_pool=model.roi_heads.box_roi_pool,
+        box_head=model.roi_heads.box_head,
+        box_predictor=box_predictor,
+        # Faster R-CNN training
+        fg_iou_thresh=0.5,
+        bg_iou_thresh=0.5,
+        batch_size_per_image=512,
+        positive_fraction=0.25,
+        bbox_reg_weights=None,
+        # Faster R-CNN inference
+        score_thresh=0.05,
+        nms_thresh=0.5,
+        detections_per_img=100,
+        # Mask
+        mask_head=model.roi_heads.mask_head,
+        mask_predictor=mask_predictor,
+        mask_roi_pool=model.roi_heads.mask_roi_pool,
     )
 
     return model
