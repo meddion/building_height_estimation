@@ -68,6 +68,10 @@ class CustomRoIHeads(RoIHeads):
         )
         self.height_predictor = value_predictor
 
+        # TODO: maybe use different loss
+        # self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.SmoothL1Loss()
+
     # TODO: impl
     def height_regression_loss(
         self,
@@ -90,10 +94,7 @@ class CustomRoIHeads(RoIHeads):
         height_proposals[zero_object_ids] = 0
         height_proposals = height_proposals.to(height_predictions.dtype)
 
-        # TODO: maybe use different loss
-        height_loss = nn.MSELoss()(height_predictions, height_proposals)
-
-        return height_loss
+        return self.loss_fn(height_predictions, height_proposals)
 
     def forward(
         self,
@@ -134,7 +135,7 @@ class CustomRoIHeads(RoIHeads):
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        height_predictions = self.height_predictor(box_features).squeeze()
+        height_predictions = self.height_predictor(box_features)
 
         result: List[Dict[str, torch.Tensor]] = []
         losses = {}
@@ -147,7 +148,7 @@ class CustomRoIHeads(RoIHeads):
                 class_logits, box_regression, labels, regression_targets
             )
 
-            loss_value_regression = self.height_regression_loss(
+            building_height_loss = self.height_regression_loss(
                 height_predictions,
                 matched_idxs,
                 labels,
@@ -157,7 +158,7 @@ class CustomRoIHeads(RoIHeads):
             losses = {
                 "loss_classifier": loss_classifier,
                 "loss_box_reg": loss_box_reg,
-                "loss_value_regression": loss_value_regression,
+                "loss_building_height_reg": building_height_loss,
             }
         else:
             # TODO: add height prediction to results

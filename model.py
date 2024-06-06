@@ -40,7 +40,7 @@ class BuildingHeightPredictor(nn.Module):
         x = F.relu(self.ln1(x))
         x = self.ln2(x)
 
-        return x
+        return x.squeeze()
 
 
 # TODO: learn how roi_heads are linked
