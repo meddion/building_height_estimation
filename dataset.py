@@ -209,6 +209,9 @@ def show_segmentation_v2(
     target_boxes=None,
     pred_labels=None,
     target_labels=None,
+    pred_title="Predicted",
+    font=None,
+    font_size=25,
     pred_colors="red",
     target_colors="blue",
 ):
@@ -218,7 +221,12 @@ def show_segmentation_v2(
     )
     if pred_boxes is not None:
         output_image_pred = draw_bounding_boxes(
-            output_image_pred, pred_boxes, labels=pred_labels, colors=pred_colors
+            output_image_pred,
+            pred_boxes,
+            labels=pred_labels,
+            colors=pred_colors,
+            font=font,
+            font_size=font_size,
         )
 
     # Draw target segmentation masks
@@ -231,13 +239,15 @@ def show_segmentation_v2(
             target_boxes,
             labels=target_labels,
             colors=target_colors,
+            font=font,
+            font_size=font_size,
         )
 
     # Plotting the images
     fig, axs = plt.subplots(1, 2, figsize=(18, 9))
 
     axs[0].imshow(output_image_pred.permute(1, 2, 0).cpu().numpy())
-    axs[0].set_title("Predicted")
+    axs[0].set_title(pred_title)
     axs[0].axis("off")
 
     axs[1].imshow(output_image_target.permute(1, 2, 0).cpu().numpy())
