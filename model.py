@@ -35,7 +35,7 @@ class TwoMLPRegression(nn.Module):
         x = F.relu(self.ln1(x))
         x = self.ln2(x)
 
-        return x.squeeze()
+        return x
 
 
 @dataclass
@@ -45,9 +45,6 @@ class ModelConfig:
     name: str = "default_model"
     num_classes: int = NUMBER_OF_CLASSES
     mask_hidden_layer_size: int = 256
-    # Constructors
-    new_optimizer: Callable = None
-    new_lr_scheduler: Callable = None
 
 
 def new_model(cfg: ModelConfig):
@@ -158,6 +155,9 @@ def train(
     num_epochs: int,
     checkpoint_dir: Path,
     checkpoint_prune_threshold: int,
+    # Constructors
+    new_optimizer: Callable = None,
+    new_lr_scheduler: Callable = None,
     print_freq: int = 10,
 ):
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -167,20 +167,20 @@ def train(
 
     params = [p for p in model.parameters() if p.requires_grad]
 
-    if model_cfg.new_optimizer is None:
+    if new_optimizer is None:
         # The weight_decay parameter in the optimizer adds a penalty to the loss function
         # based on the L2 norm of the weights, encouraging smaller weights.
         optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
     else:
-        optimizer = model_cfg.new_optimizer(params)
+        optimizer = new_optimizer(params)
 
-    if model_cfg.new_lr_scheduler is None:
+    if new_lr_scheduler is None:
         # The learning rate scheduler reduces the learning rate by a factor of 0.1 every 3 epochs.
         lr_scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=3, gamma=0.1
         )
     else:
-        lr_scheduler = model_cfg.new_lr_scheduler(optimizer)
+        lr_scheduler = new_lr_scheduler(optimizer)
 
     start_epoch = 0
 
@@ -256,6 +256,34 @@ def evaluate(model, data_loader, device):
     torch.set_num_threads(n_threads)
 
 
+def test_predict(
+    model_cfg: nn.Module,
+    checkpoint_path: str,
+    data_loader: DataLoader = None,
+    img_path=None,
+):
+    model = new_model(model_cfg)
+
+    checkpoint_dict = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint_dict["model_state_dict"])
+
+    model.eval()
+
+    if img_path is not None:
+        img = torchvision.io.read_image(img_path).unsqueeze(0)
+        transforms = T.Compose(
+            [
+                T.ToDtype(torch.float, scale=True),
+                T.ToPureTensor(),
+            ]
+        )
+        img = transforms(img)
+    else:
+        img = next(iter(data_loader))[0]
+
+    return model(img)
+
+
 if __name__ == "__main__":
     data_loader, data_loader_test = data_loaders(
         "datasets/mlc_training_data/images_annotated",
@@ -271,15 +299,22 @@ if __name__ == "__main__":
         mask_hidden_layer_size=256,
         building_height_pred=TwoMLPRegression,
         building_height_pred_loss_fn=nn.SmoothL1Loss(beta=1 / 9),
-        new_optimizer=None,
-        new_lr_scheduler=None,
     )
 
-    train(
-        data_loader,
-        data_loader_test,
-        model_cfg=model_cfg,
-        num_epochs=10,
-        checkpoint_dir=Path("checkpoints"),
-        checkpoint_prune_threshold=3,
+    print(
+        test_predict(
+            model_cfg,
+            "checkpoints/default_model_epoch_1.pt",
+            data_loader=data_loader,
+            # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
+        )
     )
+
+    # train(
+    #     data_loader,
+    #     data_loader_test,
+    #     model_cfg=model_cfg,
+    #     num_epochs=10,
+    #     checkpoint_dir=Path("checkpoints"),
+    #     checkpoint_prune_threshold=3,
+    # )

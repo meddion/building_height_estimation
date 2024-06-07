@@ -1,5 +1,8 @@
 import os
 import cv2
+import matplotlib.pyplot as plt
+from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
+import torch
 import json
 import numpy as np
 from torchvision.io import read_image
@@ -7,7 +10,6 @@ from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
 from torchvision.transforms import v2 as T
 from torchvision.ops.boxes import masks_to_boxes
-import torch
 import logging
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
@@ -142,10 +144,10 @@ def get_transform(train):
 
 def data_loaders(
     dataset_root: str,
-    train_batch_size: int,
-    test_batch_size: int,
-    test_split: float,
-    num_workers: int,
+    train_batch_size: int = 2,
+    test_batch_size: int = 1,
+    test_split: float = 0.2,
+    num_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Returns training and test data loaders.
@@ -188,3 +190,58 @@ def data_loaders(
     )
 
     return data_loader, data_loader_test
+
+
+def show_segmentation(img, masks, boxes=None, labels=None, bcolors="red"):
+    output_image = draw_segmentation_masks(img, masks.to(torch.bool), alpha=0.8)
+    if boxes is not None:
+        output_image = draw_bounding_boxes(output_image, boxes, labels, colors=bcolors)
+
+    plt.figure(figsize=(9, 9))
+    plt.imshow(output_image.permute(1, 2, 0))
+
+
+def show_segmentation_v2(
+    img,
+    pred_masks,
+    target_masks,
+    pred_boxes=None,
+    target_boxes=None,
+    pred_labels=None,
+    target_labels=None,
+    pred_colors="red",
+    target_colors="blue",
+):
+    # Draw predicted segmentation masks
+    output_image_pred = draw_segmentation_masks(
+        img.clone(), pred_masks.to(torch.bool), alpha=0.8
+    )
+    if pred_boxes is not None:
+        output_image_pred = draw_bounding_boxes(
+            output_image_pred, pred_boxes, labels=pred_labels, colors=pred_colors
+        )
+
+    # Draw target segmentation masks
+    output_image_target = draw_segmentation_masks(
+        img.clone(), target_masks.to(torch.bool), alpha=0.8
+    )
+    if target_boxes is not None:
+        output_image_target = draw_bounding_boxes(
+            output_image_target,
+            target_boxes,
+            labels=target_labels,
+            colors=target_colors,
+        )
+
+    # Plotting the images
+    fig, axs = plt.subplots(1, 2, figsize=(18, 9))
+
+    axs[0].imshow(output_image_pred.permute(1, 2, 0).cpu().numpy())
+    axs[0].set_title("Predicted")
+    axs[0].axis("off")
+
+    axs[1].imshow(output_image_target.permute(1, 2, 0).cpu().numpy())
+    axs[1].set_title("Target")
+    axs[1].axis("off")
+
+    plt.show()

@@ -15,6 +15,9 @@ from torchvision.models.detection.mask_rcnn import (
 )
 import logging
 
+import torch.nn.functional as F
+from torchvision.ops import boxes as box_ops
+
 logging.basicConfig(level=logging.DEBUG)
 
 
@@ -77,7 +80,7 @@ class CustomRoIHeads(RoIHeads):
         self.loss_fn = loss_fn
 
     # Ensure equal number of building and not building samples
-    def sample_buildings(building_indices, not_building_indices):
+    def sample_buildings(self, building_indices, not_building_indices):
         # Ensure equal number of building and not building samples
         num_buildings = len(building_indices)
         num_not_buildings = len(not_building_indices)
@@ -121,6 +124,8 @@ class CustomRoIHeads(RoIHeads):
         # Set height to 0 for not buildings
         proposal_heights[not_building_indices] = 0
         proposal_heights = proposal_heights.to(height_predictions.dtype)
+
+        height_predictions = height_predictions.squeeze()
 
         if self.sample_equal:
             sampled_indices = self.sample_buildings(
@@ -197,8 +202,12 @@ class CustomRoIHeads(RoIHeads):
             }
         else:
             # TODO: add height prediction to results
-            boxes, scores, labels = self.postprocess_detections(
-                class_logits, box_regression, proposals, image_shapes
+            boxes, scores, labels, heights = self.postprocess_detections(
+                height_predictions,
+                class_logits,
+                box_regression,
+                proposals,
+                image_shapes,
             )
             num_images = len(boxes)
             for i in range(num_images):
@@ -207,6 +216,7 @@ class CustomRoIHeads(RoIHeads):
                         "boxes": boxes[i],
                         "labels": labels[i],
                         "scores": scores[i],
+                        "heights": heights[i],
                     }
                 )
 
@@ -313,3 +323,72 @@ class CustomRoIHeads(RoIHeads):
             losses.update(loss_keypoint)
 
         return result, losses
+
+    def postprocess_detections(
+        self,
+        height_predictions,  # type: Tensor
+        class_logits,  # type: Tensor
+        box_regression,  # type: Tensor
+        proposals,  # type: List[Tensor]
+        image_shapes,  # type: List[Tuple[int, int]]
+    ):
+        # type: (...) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]
+        device = class_logits.device
+        num_classes = class_logits.shape[-1]
+
+        boxes_per_image = [boxes_in_image.shape[0] for boxes_in_image in proposals]
+        pred_boxes = self.box_coder.decode(box_regression, proposals)
+
+        pred_scores = F.softmax(class_logits, -1)
+
+        pred_boxes_list = pred_boxes.split(boxes_per_image, 0)
+        pred_scores_list = pred_scores.split(boxes_per_image, 0)
+        height_prediction_list = height_predictions.split(boxes_per_image, 0)
+
+        all_boxes = []
+        all_scores = []
+        all_labels = []
+        all_heights = []
+        for boxes, scores, heights, image_shape in zip(
+            pred_boxes_list, pred_scores_list, height_prediction_list, image_shapes
+        ):
+            boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
+
+            # create labels for each prediction
+            labels = torch.arange(num_classes, device=device)
+            labels = labels.view(1, -1).expand_as(scores)
+
+            # remove predictions with the background label
+            boxes = boxes[:, 1:]
+            scores = scores[:, 1:]
+            labels = labels[:, 1:]
+
+            # batch everything, by making every class prediction be a separate instance
+            boxes = boxes.reshape(-1, 4)
+            scores = scores.reshape(-1)
+            labels = labels.reshape(-1)
+            heights = heights.reshape(-1)
+
+            # remove low scoring boxes
+            inds = torch.where(scores > self.score_thresh)[0]
+            boxes, scores, labels = boxes[inds], scores[inds], labels[inds]
+            heights = heights[inds]
+
+            # remove empty boxes
+            keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            heights = heights[keep]
+
+            # non-maximum suppression, independently done per class
+            keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
+            # keep only topk scoring predictions
+            keep = keep[: self.detections_per_img]
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            heights = heights[keep]
+
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+            all_labels.append(labels)
+            all_heights.append(heights)
+
+        return all_boxes, all_scores, all_labels, all_heights
