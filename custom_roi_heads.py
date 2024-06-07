@@ -13,6 +13,9 @@ from torch import Tensor
 from torchvision.models.detection.mask_rcnn import (
     misc_nn_ops,
 )
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
 
 
 class CustomRoIHeads(RoIHeads):
@@ -24,8 +27,9 @@ class CustomRoIHeads(RoIHeads):
 
     def __init__(
         self,
-        value_predictor,
+        height_predictor,
         loss_fn,
+        sample_equal,
         # RoiHeads inputs:
         box_roi_pool,
         box_head,
@@ -67,13 +71,31 @@ class CustomRoIHeads(RoIHeads):
             keypoint_head,
             keypoint_predictor,
         )
-        self.height_predictor = value_predictor
 
-        # TODO: maybe use different loss
-        # self.loss_fn = nn.MSELoss()
+        self.height_predictor = height_predictor
+        self.sample_equal = sample_equal
         self.loss_fn = loss_fn
 
-    # TODO: impl
+    # Ensure equal number of building and not building samples
+    def sample_buildings(building_indices, not_building_indices):
+        # Ensure equal number of building and not building samples
+        num_buildings = len(building_indices)
+        num_not_buildings = len(not_building_indices)
+        if num_buildings > 0 and num_not_buildings > 0:
+            num_samples = min(num_buildings, num_not_buildings)
+
+            # Randomly sample indices
+            sampled_building_indices = building_indices[
+                torch.randperm(num_buildings)[:num_samples]
+            ]
+            sampled_not_building_indices = not_building_indices[
+                torch.randperm(num_not_buildings)[:num_samples]
+            ]
+
+            return torch.cat([sampled_building_indices, sampled_not_building_indices])
+
+        return torch.cat([building_indices, not_building_indices])
+
     def height_regression_loss(
         self,
         height_predictions: Tensor,
@@ -82,20 +104,32 @@ class CustomRoIHeads(RoIHeads):
         gt_heights: List[Tensor],
     ) -> Tensor:
         # TODO: simplify
-        height_proposals = []
+        proposal_heights = []
+        # Combine ground truth heights based on matched indices
+        proposal_heights = [
+            gt_heights[i][matched_idx] for i, matched_idx in enumerate(matched_idxs)
+        ]
+        proposal_heights = torch.cat(proposal_heights).to(height_predictions.device)
 
-        for i, matched_idx in enumerate(matched_idxs):
-            height_proposals.append(gt_heights[i][matched_idx])
+        # Combine labels into a single tensor
+        labels = torch.cat(labels).to(height_predictions.device)
 
-        height_proposals = torch.cat(height_proposals)
-        height_labels = torch.cat(labels)
+        # Get indices of buildings (label == 1) and not buildings (label == 0)
+        building_indices = torch.where(labels == 1)[0]
+        not_building_indices = torch.where(labels == 0)[0]
 
-        # Gets proposals ids which contain an object in them for batch 0
-        zero_object_ids = torch.where(height_labels == 0)[0]
-        height_proposals[zero_object_ids] = 0
-        height_proposals = height_proposals.to(height_predictions.dtype)
+        # Set height to 0 for not buildings
+        proposal_heights[not_building_indices] = 0
+        proposal_heights = proposal_heights.to(height_predictions.dtype)
 
-        return self.loss_fn(height_predictions, height_proposals)
+        if self.sample_equal:
+            sampled_indices = self.sample_buildings(
+                building_indices, not_building_indices
+            )
+            height_predictions = height_predictions[sampled_indices]
+            proposal_heights = proposal_heights[sampled_indices]
+
+        return self.loss_fn(height_predictions, proposal_heights)
 
     def forward(
         self,

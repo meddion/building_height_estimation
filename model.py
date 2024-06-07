@@ -72,7 +72,8 @@ def new_model(cfg: ModelConfig):
     # Copy all of the params passed to a default RoIHeads
     model.roi_heads = CustomRoIHeads(
         building_height_pred,
-        cfg.building_height_pred_loss_fn,
+        sample_equal=True,  # Sample equal number of positive and negative examples for height regression
+        loss_fn=cfg.building_height_pred_loss_fn,
         # RoIHeads inputs
         box_roi_pool=model.roi_heads.box_roi_pool,
         box_head=model.roi_heads.box_head,
@@ -80,8 +81,8 @@ def new_model(cfg: ModelConfig):
         # Faster R-CNN training
         fg_iou_thresh=0.5,
         bg_iou_thresh=0.5,
-        batch_size_per_image=512,
-        positive_fraction=0.25,
+        batch_size_per_image=512,  # Batch size of the RoI minibatch, per image
+        positive_fraction=0.25,  # Fraction of RoI minibatch that is labeled as positive
         bbox_reg_weights=None,
         # Faster R-CNN inference
         score_thresh=0.05,
@@ -265,7 +266,7 @@ if __name__ == "__main__":
     )
 
     model_cfg = ModelConfig(
-        name="default_model",
+        name="default_model_v2",
         num_classes=NUMBER_OF_CLASSES,
         mask_hidden_layer_size=256,
         building_height_pred=TwoMLPRegression,
