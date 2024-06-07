@@ -38,6 +38,30 @@ class TwoMLPRegression(nn.Module):
         return x
 
 
+class EnhancedTwoMLPRegression(nn.Module):
+    def __init__(self, in_features: int):
+        super().__init__()
+        hidden_features = in_features // 2
+        self.ln1 = nn.Linear(in_features, hidden_features)
+        self.bn1 = nn.BatchNorm1d(hidden_features)
+        self.dropout1 = nn.Dropout(p=0.5)
+
+        self.ln2 = nn.Linear(hidden_features, hidden_features // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_features // 2)
+        self.dropout2 = nn.Dropout(p=0.5)
+
+        self.ln3 = nn.Linear(hidden_features // 2, 1)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.ln1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.bn2(self.ln2(x)))
+        x = self.dropout2(x)
+        x = self.ln3(x)
+
+        return x
+
+
 @dataclass
 class ModelConfig:
     building_height_pred: nn.Module
@@ -297,24 +321,24 @@ if __name__ == "__main__":
         name="default_model_v2",
         num_classes=NUMBER_OF_CLASSES,
         mask_hidden_layer_size=256,
-        building_height_pred=TwoMLPRegression,
+        building_height_pred=EnhancedTwoMLPRegression,
         building_height_pred_loss_fn=nn.SmoothL1Loss(beta=1 / 9),
     )
 
-    print(
-        test_predict(
-            model_cfg,
-            "checkpoints/default_model_epoch_1.pt",
-            data_loader=data_loader,
-            # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
-        )
-    )
-
-    # train(
-    #     data_loader,
-    #     data_loader_test,
-    #     model_cfg=model_cfg,
-    #     num_epochs=10,
-    #     checkpoint_dir=Path("checkpoints"),
-    #     checkpoint_prune_threshold=3,
+    # print(
+    #     test_predict(
+    #         model_cfg,
+    #         "checkpoints/default_model_epoch_1.pt",
+    #         data_loader=data_loader,
+    #         # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
+    #     )
     # )
+
+    train(
+        data_loader,
+        data_loader_test,
+        model_cfg=model_cfg,
+        num_epochs=10,
+        checkpoint_dir=Path("checkpoints"),
+        checkpoint_prune_threshold=3,
+    )
