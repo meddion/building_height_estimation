@@ -62,15 +62,15 @@ class BuildingDataset(torch.utils.data.Dataset):
             with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
                 annot = json.load(f)
                 for shape in annot["shapes"]:
-                    mask = torch.zeros_like(img[0, :, :]).to(torch.uint8).numpy()
+                    mask = np.zeros(img[0, :, :].shape, dtype=np.uint8)
                     points = np.array(shape["points"], dtype=np.int32)
                     cv2.fillPoly(mask, [points], (255, 0, 0))
-                    mask = torch.tensor(mask)
                     masks.append(mask)
                     building_heights.append(shape["group_id"])
 
+            masks = np.stack(masks, axis=0)
+            masks = torch.from_numpy(masks)
             # Get bounding box coordinates for each mask
-            masks = torch.stack(masks, dim=0)
             bboxes = masks_to_boxes(masks)
             area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
 
@@ -115,7 +115,7 @@ class BuildingDataset(torch.utils.data.Dataset):
             self._delete_image_names.append(self.image_names[idx])
             del self.image_names[idx]
 
-        return self.__getitem__(idx)
+            return self.__getitem__(idx)
 
     """
     TODO: 
