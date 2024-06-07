@@ -64,17 +64,16 @@ class BuildingDataset(torch.utils.data.Dataset):
                 for shape in annot["shapes"]:
                     mask = np.zeros(img[0, :, :].shape, dtype=np.uint8)
                     points = np.array(shape["points"], dtype=np.int32)
-                    cv2.fillPoly(mask, [points], (255, 0, 0))
+                    cv2.fillPoly(mask, [points], (1, 0, 0))
                     masks.append(mask)
                     building_heights.append(shape["group_id"])
 
             masks = np.stack(masks, axis=0)
             masks = torch.from_numpy(masks)
+            masks = tv_tensors.Mask(masks)
             # Get bounding box coordinates for each mask
             bboxes = masks_to_boxes(masks)
             area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
-
-            masks = tv_tensors.Mask(masks)
 
             assert not torch.any(area < 1e-6), "Bounding box area must be positive"
             assert bboxes.min() >= 0, "Bounding box values must be positive"
