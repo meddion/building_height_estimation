@@ -10,7 +10,6 @@ from torchvision.models.detection.roi_heads import (
     keypointrcnn_loss,
 )
 from torch import Tensor
-from torch import nn
 from torchvision.models.detection.mask_rcnn import (
     misc_nn_ops,
 )
@@ -26,6 +25,8 @@ class CustomRoIHeads(RoIHeads):
     def __init__(
         self,
         value_predictor,
+        loss_fn,
+        # RoiHeads inputs:
         box_roi_pool,
         box_head,
         box_predictor,
@@ -70,7 +71,7 @@ class CustomRoIHeads(RoIHeads):
 
         # TODO: maybe use different loss
         # self.loss_fn = nn.MSELoss()
-        self.loss_fn = nn.SmoothL1Loss()
+        self.loss_fn = loss_fn
 
     # TODO: impl
     def height_regression_loss(

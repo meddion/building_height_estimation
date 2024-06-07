@@ -1,5 +1,6 @@
 import torch.utils
 import os
+from typing import Callable, Tuple
 import time
 from torch import nn
 import torch.utils.data
@@ -8,28 +9,22 @@ import logging
 import re
 from pathlib import Path
 import utils
-from dataset import BuildingDataset, NUMBER_OF_CLASSES
+from dataset import data_loaders, NUMBER_OF_CLASSES
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import (
     MaskRCNNPredictor,
 )
 import torchvision
-from torchvision.transforms import v2 as T
 from engine import train_one_epoch, evaluate
 from custom_roi_heads import CustomRoIHeads
+from dataclasses import dataclass
+from torch.utils.data import DataLoader
 
 
 logging.basicConfig(level=logging.INFO)
 
-CHECKPOINT_DIR = Path("checkpoints")
-CHECKPOINT_PRUNE_THRESHOLD = 3  # No more than N latest checkpoints to keep.
-NUMBER_OF_EPOCHS_DEFAULT = 10
-TRAIN_BATCH_SIZE = 3
-TEST_BATCH_SIZE = 1
-TEST_SPLIT = 0.2
 
-
-class BuildingHeightPredictor(nn.Module):
+class TwoMLPRegression(nn.Module):
     def __init__(self, in_features: int):
         super().__init__()
         hiddden_features = in_features // 2
@@ -43,8 +38,19 @@ class BuildingHeightPredictor(nn.Module):
         return x.squeeze()
 
 
-# TODO: learn how roi_heads are linked
-def get_model_instance_segmentation(num_classes):
+@dataclass
+class ModelConfig:
+    building_height_pred: nn.Module
+    building_height_pred_loss_fn: Callable
+    name: str = "default_model"
+    num_classes: int = NUMBER_OF_CLASSES
+    mask_hidden_layer_size: int = 256
+    # Constructors
+    new_optimizer: Callable = None
+    new_lr_scheduler: Callable = None
+
+
+def new_model(cfg: ModelConfig):
     # Load an instance segmentation model pre-trained on COCO
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
 
@@ -53,19 +59,21 @@ def get_model_instance_segmentation(num_classes):
     in_features = model.roi_heads.box_predictor.cls_score.in_features
 
     # Add a new regression head to predict building height
-    building_height_pred = BuildingHeightPredictor(in_features)
+    building_height_pred = cfg.building_height_pred(in_features)
 
     # Replace the pre-trained head with a new one
-    box_predictor = FastRCNNPredictor(in_features, num_classes)
+    box_predictor = FastRCNNPredictor(in_features, cfg.num_classes)
     # Get the number of input features for the mask classifier
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    hidden_layer = 256
-    # Replace the mask predictor with a new one
-    mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_layer, num_classes)
+    mask_predictor = MaskRCNNPredictor(
+        in_features_mask, cfg.mask_hidden_layer_size, cfg.num_classes
+    )
 
     # Copy all of the params passed to a default RoIHeads
     model.roi_heads = CustomRoIHeads(
         building_height_pred,
+        cfg.building_height_pred_loss_fn,
+        # RoIHeads inputs
         box_roi_pool=model.roi_heads.box_roi_pool,
         box_head=model.roi_heads.box_head,
         box_predictor=box_predictor,
@@ -88,135 +96,17 @@ def get_model_instance_segmentation(num_classes):
     return model
 
 
-def get_transform(train):
-    transforms = []
-    if train:
-        transforms.append(T.RandomHorizontalFlip(0.5))
-    # TODO: find out what scale does
-    transforms.append(T.ToDtype(torch.float, scale=True))
-    transforms.append(T.ToPureTensor())
+class Checkpoint:
+    def __init__(self, root_dir: Path, model_name: str) -> None:
+        self.root_dir = root_dir
+        self.model_name = model_name
 
-    return T.Compose(transforms)
+    def load_latest(self) -> Tuple[dict, str]:
+        checkpoint_path = self._latest_epoch_checkpoint()
 
+        return torch.load(checkpoint_path), checkpoint_path
 
-def sorted_checkpoints() -> list[Path]:
-    def extract_number(file_obj: Path):
-        match = re.search(r"\d+", file_obj.stem)
-        return int(match.group()) if match else 0
-
-    files = list(CHECKPOINT_DIR.glob("model_epoch_*.pt"))
-
-    return sorted(files, key=extract_number)
-
-
-def prune_old_checkpoints(threshold: int):
-    files = sorted_checkpoints()
-
-    if len(files) < threshold:
-        return
-
-    for file in files[:-threshold]:
-        os.remove(file)
-
-
-def latest_epoch_checkpoint() -> Path:
-    files = sorted_checkpoints()
-
-    if len(files) == 0:
-        raise FileNotFoundError
-
-    return files[-1]
-
-
-def epoch_checkpoint_filepath(epoch) -> Path:
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-    return CHECKPOINT_DIR / f"model_epoch_{epoch}.pt"
-
-
-def train(
-    dataset_root: str,
-    num_epochs: int = NUMBER_OF_EPOCHS_DEFAULT,
-    train_batch_size: int = TRAIN_BATCH_SIZE,
-    test_batch_size: int = TEST_BATCH_SIZE,
-    test_split: float = TEST_SPLIT,
-):
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-    dataset = BuildingDataset(
-        dataset_root,
-        transforms=get_transform(train=True),
-    )
-
-    dataset_test = BuildingDataset(
-        dataset_root,
-        transforms=get_transform(train=False),
-    )
-
-    # Split the dataset in train and test set.
-    indices = torch.randperm(len(dataset)).tolist()
-    test_split = int(test_split * len(dataset))
-    dataset = torch.utils.data.Subset(dataset, indices[:-test_split])
-    dataset_test = torch.utils.data.Subset(dataset_test, indices[-test_split:])
-
-    logging.info(
-        f"Size of training set {len(dataset)}. Sise of test set: {len(dataset_test)}"
-    )
-
-    # define training and validation data loaders
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=train_batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=utils.collate_fn,
-    )
-
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset_test,
-        batch_size=test_batch_size,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=utils.collate_fn,
-    )
-
-    model = get_model_instance_segmentation(NUMBER_OF_CLASSES)
-    model.to(device)
-
-    # Optimizer.
-    params = [p for p in model.parameters() if p.requires_grad]
-    # The weight_decay parameter in the optimizer adds a penalty to the loss function
-    # based on the L2 norm of the weights, encouraging smaller weights.
-    optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
-    # The learning rate scheduler reduces the learning rate by a factor of 0.1 every 3 epochs.
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-    start_epoch = 0
-    try:
-        checkpoint_path = latest_epoch_checkpoint()
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        logging.info(
-            f"Loaded the {checkpoint_path} checkpoint, starting training at the {start_epoch} epoch with loss {checkpoint['loss']}",
-        )
-    except FileNotFoundError:
-        logging.info("No checkpoint found, starting from scratch")
-
-    for epoch in range(start_epoch, num_epochs):
-        # Train for one epoch, printing every 10 iterations.
-        _, latest_loss = train_one_epoch(
-            model, optimizer, data_loader, device, epoch, num_epochs, print_freq=10
-        )
-
-        # Update the learning rate
-        lr_scheduler.step()
-        # Evaluate on the test dataset
-        evaluate(model, data_loader_test, device=device)
-
-        logging.debug(f"Saving model parameters on {epoch} with loss {latest_loss}")
+    def save(self, epoch: int, model, optimizer, lr_scheduler, latest_loss: float):
         torch.save(
             {
                 "epoch": epoch,
@@ -225,9 +115,111 @@ def train(
                 "lr_scheduler_state_dict": lr_scheduler.state_dict(),
                 "loss": latest_loss,
             },
-            epoch_checkpoint_filepath(epoch),
+            self._file_name(epoch),
         )
-        prune_old_checkpoints(CHECKPOINT_PRUNE_THRESHOLD)
+
+    def prune_old(self, threshold: int):
+        files = self._sorted_checkpoint_files()
+
+        if len(files) < threshold:
+            return
+
+        for file in files[:-threshold]:
+            os.remove(file)
+
+    def _latest_epoch_checkpoint(self) -> Path:
+        files = self._sorted_checkpoint_files()
+
+        if len(files) == 0:
+            raise FileNotFoundError
+
+        return files[-1]
+
+    def _sorted_checkpoint_files(self) -> list[Path]:
+        def extract_number(file_obj: Path):
+            match = re.search(r"\d+", file_obj.stem)
+            return int(match.group()) if match else 0
+
+        files = list(self.root_dir.glob(f"{self.model_name}_epoch_*.pt"))
+
+        return sorted(files, key=extract_number)
+
+    def _file_name(self, epoch) -> Path:
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+        return self.root_dir / f"{self.model_name}_epoch_{epoch}.pt"
+
+
+def train(
+    data_loader: DataLoader,
+    data_loader_test: DataLoader,
+    model_cfg: ModelConfig,
+    num_epochs: int,
+    checkpoint_dir: Path,
+    checkpoint_prune_threshold: int,
+    print_freq: int = 10,
+):
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    model = new_model(model_cfg)
+    model.to(device)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    if model_cfg.new_optimizer is None:
+        # The weight_decay parameter in the optimizer adds a penalty to the loss function
+        # based on the L2 norm of the weights, encouraging smaller weights.
+        optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+    else:
+        optimizer = model_cfg.new_optimizer(params)
+
+    if model_cfg.new_lr_scheduler is None:
+        # The learning rate scheduler reduces the learning rate by a factor of 0.1 every 3 epochs.
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=3, gamma=0.1
+        )
+    else:
+        lr_scheduler = model_cfg.new_lr_scheduler(optimizer)
+
+    start_epoch = 0
+
+    checkpoint = Checkpoint(checkpoint_dir, model_cfg.name)
+
+    try:
+        checkpoint_dict, checkpoint_path = checkpoint.load_latest()
+        model.load_state_dict(checkpoint_dict["model_state_dict"])
+        optimizer.load_state_dict(checkpoint_dict["optimizer_state_dict"])
+        lr_scheduler.load_state_dict(checkpoint_dict["lr_scheduler_state_dict"])
+        start_epoch = checkpoint_dict["epoch"] + 1
+        loss = checkpoint_dict["loss"]
+        logging.info(
+            f"Loaded the {checkpoint_path} checkpoint, starting training at the {start_epoch} epoch with loss {loss}",
+        )
+    except FileNotFoundError:
+        logging.info("No checkpoint found, starting from scratch")
+
+    for epoch in range(start_epoch, num_epochs):
+        # Train for one epoch, printing every print_freq
+        _, latest_loss = train_one_epoch(
+            model,
+            optimizer,
+            data_loader,
+            device,
+            epoch,
+            num_epochs,
+            print_freq=print_freq,
+        )
+
+        # Update the learning rate
+        lr_scheduler.step()
+
+        # Evaluate on the test dataset
+        evaluate(model, data_loader_test, device=device)
+
+        logging.debug(f"Saving model parameters on {epoch} with loss {latest_loss}")
+
+        checkpoint.save(epoch, model, optimizer, lr_scheduler, latest_loss)
+        checkpoint.prune_old(checkpoint_prune_threshold)
 
 
 # TODO: impl proper evaluation
@@ -264,4 +256,29 @@ def evaluate(model, data_loader, device):
 
 
 if __name__ == "__main__":
-    train("datasets/mlc_training_data/images_annotated")
+    data_loader, data_loader_test = data_loaders(
+        "datasets/mlc_training_data/images_annotated",
+        train_batch_size=2,
+        test_batch_size=1,
+        test_split=0.2,
+        num_workers=4,
+    )
+
+    model_cfg = ModelConfig(
+        name="default_model",
+        num_classes=NUMBER_OF_CLASSES,
+        mask_hidden_layer_size=256,
+        building_height_pred=TwoMLPRegression,
+        building_height_pred_loss_fn=nn.SmoothL1Loss(beta=1 / 9),
+        new_optimizer=None,
+        new_lr_scheduler=None,
+    )
+
+    train(
+        data_loader,
+        data_loader_test,
+        model_cfg=model_cfg,
+        num_epochs=10,
+        checkpoint_dir=Path("checkpoints"),
+        checkpoint_prune_threshold=3,
+    )

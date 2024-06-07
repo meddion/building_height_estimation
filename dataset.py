@@ -5,11 +5,16 @@ import numpy as np
 from torchvision.io import read_image
 from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
+from torchvision.transforms import v2 as T
 from torchvision.ops.boxes import masks_to_boxes
 import torch
 import logging
 from pathlib import Path
-
+from torch.utils.data import Dataset, DataLoader
+import torch.utils
+from typing import Tuple
+import torch.utils.data
+import utils
 
 MASK_POSTFIX = "_mask"
 
@@ -25,7 +30,7 @@ IGNORE_IMG_LIST = [
 ]
 
 
-class BuildingDataset(torch.utils.data.Dataset):
+class BuildingDataset(Dataset):
     def __init__(self, root_dir: str, transforms=None) -> None:
         super().__init__()
 
@@ -122,3 +127,64 @@ class BuildingDataset(torch.utils.data.Dataset):
     then it is recommended to also implement a get_height_and_width method, which returns the height and the width of the image.
     If this method is not provided, we query all elements of the dataset via __getitem__ , which loads the image in memory and is slower than if a custom method is provided.
     """
+
+
+def get_transform(train):
+    transforms = []
+    if train:
+        transforms.append(T.RandomHorizontalFlip(0.5))
+    # TODO: find out what scale does
+    transforms.append(T.ToDtype(torch.float, scale=True))
+    transforms.append(T.ToPureTensor())
+
+    return T.Compose(transforms)
+
+
+def data_loaders(
+    dataset_root: str,
+    train_batch_size: int,
+    test_batch_size: int,
+    test_split: float,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Returns training and test data loaders.
+    """
+    dataset = BuildingDataset(
+        dataset_root,
+        transforms=get_transform(train=True),
+    )
+
+    dataset_test = BuildingDataset(
+        dataset_root,
+        transforms=get_transform(train=False),
+    )
+
+    # Split the dataset in train and test set.
+    indices = torch.randperm(len(dataset)).tolist()
+    test_split = int(test_split * len(dataset))
+    dataset = torch.utils.data.Subset(dataset, indices[:-test_split])
+    dataset_test = torch.utils.data.Subset(dataset_test, indices[-test_split:])
+
+    logging.info(
+        f"Size of training set {len(dataset)}. Sise of test set: {len(dataset_test)}"
+    )
+
+    # define training and validation data loaders
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=train_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=utils.collate_fn,
+    )
+
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=test_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=utils.collate_fn,
+    )
+
+    return data_loader, data_loader_test
