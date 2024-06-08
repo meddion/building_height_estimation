@@ -17,6 +17,10 @@ import torch.utils
 from typing import Tuple
 import torch.utils.data
 import utils
+from typing import Callable, List, Type
+import fnmatch
+from skimage.measure import label
+from torch import Tensor
 
 MASK_POSTFIX = "_mask"
 
@@ -33,9 +37,14 @@ IGNORE_IMG_LIST = [
 
 
 class BuildingDataset(Dataset):
-    def __init__(self, root_dir: str, transforms=None) -> None:
+    def __init__(
+        self,
+        root_dir: str,
+        transforms=None,
+    ) -> None:
         super().__init__()
 
+        # TODO: rewrite it with img paths
         self.root_dir = Path(root_dir)
         extensions = ["*.png", "*.jpeg", "*.jpg"]
         self.image_names = sorted(
@@ -68,6 +77,13 @@ class BuildingDataset(Dataset):
             masks = []
             with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
                 annot = json.load(f)
+
+                # # TODO: rm
+                # if len(annot["shapes"]) > 100:
+                #     raise ValueError(
+                #         f"More then 100 buildings (got {len(annot['shapes'])}) in the image {self.image_names[idx]}"
+                #     )
+
                 for shape in annot["shapes"]:
                     mask = np.zeros(img[0, :, :].shape, dtype=np.uint8)
                     points = np.array(shape["points"], dtype=np.int32)
@@ -131,7 +147,123 @@ class BuildingDataset(Dataset):
     """
 
 
-def get_transform(train):
+def image_paths(
+    root_dir: str, image_name_filter: Callable[[str], bool] = None
+) -> List[Path]:
+    """
+    Returns a list of image names from the given root directories.
+    """
+    extensions = ["*.png", "*.jpeg", "*.jpg"]
+    image_names = []
+
+    for dirname, _dirnames, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if not any(fnmatch.fnmatch(filename, ext) for ext in extensions):
+                continue
+
+            if image_name_filter is not None and not image_name_filter(filename):
+                continue
+
+            relative_filename = Path(dirname) / filename
+            image_names.append(relative_filename)
+
+    return sorted(image_names, key=lambda x: str(x))
+
+
+class MiyazakiDataset(Dataset):
+    """
+    Miyazaki dataset has images of buildings and their segmentation masks,
+    The masks are stored as grey scale images with 'a' prefix and '.png' extension
+    and the corresponding building images have the same name with 'i' prefix and '.jpg' extension.
+    For example:
+        aKEN0002248.png - is a mask for the building image iKEN0002248.jpg
+    """
+
+    def __init__(self, root_dir: str, transforms=None):
+        self.image_paths = image_paths(root_dir, lambda x: x.startswith("i"))
+        self.transforms = transforms
+        self.deleted_images = []
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[Tensor, dict]:
+        if idx >= len(self.image_paths):
+            raise StopIteration
+
+        try:
+            img_path = self.image_paths[idx]
+            mask_path = img_path.with_name(img_path.stem.replace("i", "a") + ".png")
+
+            img_path = str(img_path)
+            img = read_image(img_path)
+            img = tv_tensors.Image(img)
+
+            # Read with cv2 because label expects numpy array.
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            colored_mask, num_labels = label(
+                mask, background=0, return_num=True, connectivity=2
+            )
+            colored_mask = torch.from_numpy(colored_mask)
+            obj_ids = torch.tensor(range(num_labels + 1))
+            obj_ids = obj_ids[1:]  # Remove the background
+            # Split the color-encoded mask into a set of binary masks
+            masks = (colored_mask == obj_ids[:, None, None]).to(dtype=torch.uint8)
+            masks = tv_tensors.Mask(masks)
+
+            bboxes = masks_to_boxes(masks)
+            bboxes = tv_tensors.BoundingBoxes(
+                bboxes,
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=F.get_size(img),
+            )
+            area = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+
+            # If there are no bounding boxes, then there are no masks.
+            if bboxes.shape[0] != 0:
+                degenerate_boxes = bboxes[:, 2:] <= bboxes[:, :2]
+                if degenerate_boxes.any():
+                    # Get indicies of degenerate boxes to delete
+                    indices_to_remove = torch.unique(torch.where(degenerate_boxes)[0])
+                    all_indices = torch.arange(bboxes.shape[0])
+
+                    # Create a boolean mask with the indices to keep
+                    keep = torch.isin(all_indices, indices_to_remove, invert=True)
+
+                    bboxes = bboxes[keep]
+                    area = area[keep]
+                    masks = masks[keep]
+
+                if bboxes.min() < 0:
+                    raise ValueError("Bounding box values must be positive")
+
+            # There is only one class on masks, a building.
+            labels = torch.ones(masks.shape[0], dtype=torch.int64)
+            target = {
+                "masks": masks,
+                "boxes": bboxes,
+                "labels": labels,
+                "image_id": idx,
+                "image_path": img_path,
+                "area": area,
+            }
+
+            if self.transforms is not None:
+                img, target = self.transforms(img, target)
+
+            return img, target
+
+        except Exception as e:
+            logging.warn(
+                f"Got error while processing image {self.image_paths[idx]} (idx: {idx}): {e}. Deleting it from the image list and skipping it."
+            )
+            self.deleted_images.append(self.image_paths[idx])
+            del self.image_paths[idx]
+
+            return self.__getitem__(idx)
+
+
+def get_transform(train: bool) -> T.Transform:
     transforms = []
     if train:
         transforms.append(T.RandomHorizontalFlip(0.5))
@@ -144,6 +276,7 @@ def get_transform(train):
 
 def data_loaders(
     dataset_root: str,
+    dataset_cls: Type,
     train_batch_size: int = 2,
     test_batch_size: int = 1,
     test_split: float = 0.2,
@@ -152,12 +285,12 @@ def data_loaders(
     """
     Returns training and test data loaders.
     """
-    dataset = BuildingDataset(
+    dataset = dataset_cls(
         dataset_root,
         transforms=get_transform(train=True),
     )
 
-    dataset_test = BuildingDataset(
+    dataset_test = dataset_cls(
         dataset_root,
         transforms=get_transform(train=False),
     )
@@ -193,6 +326,15 @@ def data_loaders(
 
 
 def show_segmentation(img, masks, boxes=None, labels=None, bcolors="red"):
+    if img.dtype != torch.uint8:
+        transform = T.Compose(
+            [
+                T.Lambda(lambda x: x * 255.0),  # Scale to [0, 255]
+                T.Lambda(lambda x: x.to(torch.uint8)),  # Convert to uint8
+            ]
+        )
+        img = transform(img)
+
     output_image = draw_segmentation_masks(img, masks.to(torch.bool), alpha=0.8)
     if boxes is not None:
         output_image = draw_bounding_boxes(output_image, boxes, labels, colors=bcolors)

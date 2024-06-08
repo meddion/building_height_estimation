@@ -17,6 +17,8 @@ import logging
 
 import torch.nn.functional as F
 from torchvision.ops import boxes as box_ops
+from typing import Optional, Callable
+from torch import nn
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -30,9 +32,10 @@ class CustomRoIHeads(RoIHeads):
 
     def __init__(
         self,
-        height_predictor,
-        loss_fn,
-        sample_equal,
+        height_predictor: Optional[nn.Module],
+        loss_fn: Optional[Callable],
+        height_pred_after_roi_pool: bool,
+        sample_equal: bool,
         # RoiHeads inputs:
         box_roi_pool,
         box_head,
@@ -74,7 +77,7 @@ class CustomRoIHeads(RoIHeads):
             keypoint_head,
             keypoint_predictor,
         )
-
+        self.height_pred_after_roi_pool = height_pred_after_roi_pool
         self.height_predictor = height_predictor
         self.sample_equal = sample_equal
         self.loss_fn = loss_fn
@@ -171,11 +174,15 @@ class CustomRoIHeads(RoIHeads):
             regression_targets = None
             matched_idxs = None
 
-        box_features = self.box_roi_pool(features, proposals, image_shapes)
-        box_features = self.box_head(box_features)
+        box_features_roi_pool = self.box_roi_pool(features, proposals, image_shapes)
+        box_features = self.box_head(box_features_roi_pool)
         class_logits, box_regression = self.box_predictor(box_features)
 
-        height_predictions = self.height_predictor(box_features)
+        if self.height_predictor is not None:
+            if self.height_pred_after_roi_pool:
+                height_predictions = self.height_predictor(box_features_roi_pool)
+            else:
+                height_predictions = self.height_predictor(box_features)
 
         result: List[Dict[str, torch.Tensor]] = []
         losses = {}
@@ -188,37 +195,48 @@ class CustomRoIHeads(RoIHeads):
                 class_logits, box_regression, labels, regression_targets
             )
 
-            building_height_loss = self.height_regression_loss(
-                height_predictions,
-                matched_idxs,
-                labels,
-                [t["building_heights"] for t in targets],
-            )
-
             losses = {
                 "loss_classifier": loss_classifier,
                 "loss_box_reg": loss_box_reg,
-                "loss_building_height_reg": building_height_loss,
             }
+
+            if self.height_predictor is not None:
+                losses["loss_building_height_reg"] = self.height_regression_loss(
+                    height_predictions,
+                    matched_idxs,
+                    labels,
+                    [t["building_heights"] for t in targets],
+                )
+
         else:
-            # TODO: add height prediction to results
-            boxes, scores, labels, heights = self.postprocess_detections(
-                height_predictions,
-                class_logits,
-                box_regression,
-                proposals,
-                image_shapes,
-            )
+            if self.height_predictor is not None:
+                boxes, scores, labels, heights = self.postprocess_detections(
+                    height_predictions,
+                    class_logits,
+                    box_regression,
+                    proposals,
+                    image_shapes,
+                )
+            else:
+                boxes, scores, labels = super().postprocess_detections(
+                    class_logits,
+                    box_regression,
+                    proposals,
+                    image_shapes,
+                )
+
             num_images = len(boxes)
             for i in range(num_images):
-                result.append(
-                    {
-                        "boxes": boxes[i],
-                        "labels": labels[i],
-                        "scores": scores[i],
-                        "heights": heights[i],
-                    }
-                )
+                res = {
+                    "boxes": boxes[i],
+                    "labels": labels[i],
+                    "scores": scores[i],
+                }
+
+                if self.height_predictor is not None:
+                    res["heights"] = heights[i]
+
+                result.append(res)
 
         if self.has_mask():
             mask_proposals = [p["boxes"] for p in result]

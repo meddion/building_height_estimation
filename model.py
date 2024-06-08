@@ -1,24 +1,25 @@
 import torch.utils
 import os
-from typing import Callable, Tuple
-import time
+from typing import Callable, Tuple, Optional, Type
 from torch import nn
 import torch.utils.data
 import torch.nn.functional as F
 import logging
 import re
 from pathlib import Path
-import utils
-from dataset import data_loaders, NUMBER_OF_CLASSES
+from dataset import data_loaders, NUMBER_OF_CLASSES, MiyazakiDataset
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import (
     MaskRCNNPredictor,
 )
 import torchvision
-from engine import train_one_epoch, evaluate
 from custom_roi_heads import CustomRoIHeads
 from dataclasses import dataclass
 from torch.utils.data import DataLoader
+from torchvision.transforms import v2 as T
+from engine import train_one_epoch
+import torch
+from sklearn.metrics import jaccard_score
 
 
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +33,8 @@ class TwoMLPRegression(nn.Module):
         self.ln2 = nn.Linear(hiddden_features, 1)
 
     def forward(self, x):
+        x = x.flatten(start_dim=1)
+
         x = F.relu(self.ln1(x))
         x = self.ln2(x)
 
@@ -53,6 +56,9 @@ class EnhancedTwoMLPRegression(nn.Module):
         self.ln3 = nn.Linear(hidden_features // 2, 1)
 
     def forward(self, x):
+        # TODO: think about it
+        x = x.flatten(start_dim=1)
+
         x = F.relu(self.bn1(self.ln1(x)))
         x = self.dropout1(x)
         x = F.relu(self.bn2(self.ln2(x)))
@@ -62,13 +68,26 @@ class EnhancedTwoMLPRegression(nn.Module):
         return x
 
 
+class SimpleBuildingHeightPred(nn.Module):
+    def __init__(self, in_features: int):
+        super().__init__()
+        self.ln1 = nn.Linear(in_features, 1)
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+
+        return self.ln1(x)
+
+
 @dataclass
 class ModelConfig:
-    building_height_pred: nn.Module
-    building_height_pred_loss_fn: Callable
     name: str = "default_model"
     num_classes: int = NUMBER_OF_CLASSES
     mask_hidden_layer_size: int = 256
+    building_height_pred_class: Optional[Type] = None
+    building_height_pred_loss_fn: Optional[Callable] = None
+    height_pred_after_roi_pool: bool = False
+    sample_equal: bool = False
 
 
 def new_model(cfg: ModelConfig):
@@ -80,10 +99,24 @@ def new_model(cfg: ModelConfig):
     in_features = model.roi_heads.box_predictor.cls_score.in_features
 
     # Add a new regression head to predict building height
-    building_height_pred = cfg.building_height_pred(in_features)
+    building_height_pred_instance = None
+    if cfg.building_height_pred_class is not None:
+        assert (
+            cfg.building_height_pred_loss_fn is not None
+        ), "Loss function must be provided"
+
+        if cfg.height_pred_after_roi_pool:
+            resolution = model.roi_heads.box_roi_pool.output_size[0]
+            out_channels = model.backbone.out_channels
+            building_height_pred_instance = cfg.building_height_pred_class(
+                out_channels * resolution**2
+            )
+        else:
+            building_height_pred_instance = cfg.building_height_pred_class(in_features)
 
     # Replace the pre-trained head with a new one
     box_predictor = FastRCNNPredictor(in_features, cfg.num_classes)
+
     # Get the number of input features for the mask classifier
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     mask_predictor = MaskRCNNPredictor(
@@ -92,9 +125,10 @@ def new_model(cfg: ModelConfig):
 
     # Copy all of the params passed to a default RoIHeads
     model.roi_heads = CustomRoIHeads(
-        building_height_pred,
-        sample_equal=True,  # Sample equal number of positive and negative examples for height regression
-        loss_fn=cfg.building_height_pred_loss_fn,
+        building_height_pred_instance,
+        cfg.building_height_pred_loss_fn,
+        cfg.height_pred_after_roi_pool,
+        cfg.sample_equal,  # Sample equal number of positive and negative examples for height regression
         # RoIHeads inputs
         box_roi_pool=model.roi_heads.box_roi_pool,
         box_head=model.roi_heads.box_head,
@@ -179,6 +213,7 @@ def train(
     num_epochs: int,
     checkpoint_dir: Path,
     checkpoint_prune_threshold: int,
+    eval_iterations: int = 0,
     # Constructors
     new_optimizer: Callable = None,
     new_lr_scheduler: Callable = None,
@@ -235,11 +270,12 @@ def train(
             print_freq=print_freq,
         )
 
-        # Update the learning rate
+        # # Update the learning rate
         lr_scheduler.step()
 
         # Evaluate on the test dataset
-        evaluate(model, data_loader_test, device=device)
+        mean_iou = evaluate(model, data_loader_test, device, eval_iterations)
+        logging.info(f"Mean IoU: {mean_iou}")
 
         logging.debug(f"Saving model parameters on {epoch} with loss {latest_loss}")
 
@@ -248,36 +284,90 @@ def train(
 
 
 # TODO: impl proper evaluation
+# def evaluate(model, data_loader, device):
+#     n_threads = torch.get_num_threads()
+#     # FIXME remove this and make paste_masks_in_image run on the GPU
+#     torch.set_num_threads(1)
+#     cpu_device = torch.device("cpu")
+#     model.eval()
+
+#     metric_logger = local_utils.MetricLogger(delimiter="  ")
+#     for images, targets in metric_logger.log_every(data_loader, 100, header="Test:"):
+#         images = list(img.to(device) for img in images)
+
+#         if torch.cuda.is_available():
+#             torch.cuda.synchronize()
+
+#         model_time = time.time()
+
+#         outputs = model(images)
+#         outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
+#         model_time = time.time() - model_time
+
+#         evaluator_time = time.time()
+#         res = {target["image_id"]: output for target, output in zip(targets, outputs)}
+#         logging.debug(f"Results: {res}")
+#         # TODO: Run evaluator
+#         evaluator_time = time.time() - evaluator_time
+
+#         metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
+
+#     torch.set_num_threads(n_threads)
+
+
 @torch.inference_mode()
-def evaluate(model, data_loader, device):
-    n_threads = torch.get_num_threads()
-    # FIXME remove this and make paste_masks_in_image run on the GPU
-    torch.set_num_threads(1)
-    cpu_device = torch.device("cpu")
+def evaluate(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    eval_iterations: int = 0,
+) -> float:
+    """
+    Evaluate a segmentation model.
+
+    Returns:
+        float: The mean IoU score for the dataset.
+    """
     model.eval()
+    model.to(device)
 
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    for images, targets in metric_logger.log_every(data_loader, 100, header="Test:"):
-        images = list(img.to(device) for img in images)
+    total_iou = 0
+    num_samples = 0
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    if eval_iterations == 0:
+        eval_iterations = len(data_loader)
 
-        model_time = time.time()
+    for _ in range(eval_iterations):
+        images, targets = next(iter(data_loader))
+
+        images = [image.to(device) for image in images]
+        targets = [
+            {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in t.items()
+            }
+            for t in targets
+        ]
 
         outputs = model(images)
-        outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
-        model_time = time.time() - model_time
+        for output, target in zip(outputs, targets):
+            pred_masks = output["masks"].squeeze(1).cpu().numpy()
+            true_masks = target["masks"].cpu().numpy()
 
-        evaluator_time = time.time()
-        res = {target["image_id"]: output for target, output in zip(targets, outputs)}
-        logging.debug(f"Results: {res}")
-        # TODO: Run evaluator
-        evaluator_time = time.time() - evaluator_time
+            for pred_mask, true_mask in zip(pred_masks, true_masks):
+                pred_mask = (pred_mask > 0.5).astype(float)
+                true_mask = true_mask.astype(float)
 
-        metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
+                # Compute IoU
+                iou = jaccard_score(
+                    true_mask.flatten(), pred_mask.flatten(), average="binary"
+                )
+                total_iou += iou
+                num_samples += 1
 
-    torch.set_num_threads(n_threads)
+    mean_iou = total_iou / num_samples
+
+    return mean_iou
 
 
 def test_predict(
@@ -286,6 +376,15 @@ def test_predict(
     data_loader: DataLoader = None,
     img_path=None,
 ):
+    # print(
+    #     test_predict(
+    #         model_cfg,
+    #         "checkpoints/default_model_epoch_1.pt",
+    #         data_loader=data_loader,
+    #         # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
+    #     )
+    # )
+
     model = new_model(model_cfg)
 
     checkpoint_dict = torch.load(checkpoint_path)
@@ -310,7 +409,8 @@ def test_predict(
 
 if __name__ == "__main__":
     data_loader, data_loader_test = data_loaders(
-        "datasets/mlc_training_data/images_annotated",
+        "datasets/miyazaki/jpn",
+        dataset_cls=MiyazakiDataset,
         train_batch_size=2,
         test_batch_size=1,
         test_split=0.2,
@@ -318,21 +418,11 @@ if __name__ == "__main__":
     )
 
     model_cfg = ModelConfig(
-        name="default_model_v2",
+        name="pretrained_seg_miyazaki_jpn",
         num_classes=NUMBER_OF_CLASSES,
         mask_hidden_layer_size=256,
-        building_height_pred=EnhancedTwoMLPRegression,
-        building_height_pred_loss_fn=nn.SmoothL1Loss(beta=1 / 9),
+        building_height_pred_class=None,
     )
-
-    # print(
-    #     test_predict(
-    #         model_cfg,
-    #         "checkpoints/default_model_epoch_1.pt",
-    #         data_loader=data_loader,
-    #         # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
-    #     )
-    # )
 
     train(
         data_loader,
