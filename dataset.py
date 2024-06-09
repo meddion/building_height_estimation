@@ -318,7 +318,7 @@ def get_transform(train: bool) -> T.Compose:
 def data_loaders(
     dataset_root: str,
     dataset_cls: Type,
-    get_transform: Callable = get_transform,
+    get_transform: Callable[[bool]] = get_simple_transform,
     train_batch_size: int = 2,
     test_batch_size: int = 1,
     test_split: float = 0.2,
