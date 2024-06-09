@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import logging
 import re
 from pathlib import Path
-from dataset import data_loaders, NUMBER_OF_CLASSES, MiyazakiDataset
+from dataset import NUMBER_OF_CLASSES, BuildingDataset, data_loaders
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import (
     MaskRCNNPredictor,
@@ -17,9 +17,10 @@ from custom_roi_heads import CustomRoIHeads
 from dataclasses import dataclass
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
-from engine import train_one_epoch
 import torch
 from sklearn.metrics import jaccard_score
+from engine import train_one_epoch
+from torch.nn import SmoothL1Loss
 
 
 logging.basicConfig(level=logging.INFO)
@@ -90,30 +91,15 @@ class ModelConfig:
     sample_equal: bool = False
 
 
-def new_model(cfg: ModelConfig):
+def new_model(cfg: ModelConfig) -> nn.Module:
     # Load an instance segmentation model pre-trained on COCO
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+    model.config = cfg
 
     # Get number of input features for the classifier.
     # This is a size of features that we get from the backbone.
+
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-
-    # Add a new regression head to predict building height
-    building_height_pred_instance = None
-    if cfg.building_height_pred_class is not None:
-        assert (
-            cfg.building_height_pred_loss_fn is not None
-        ), "Loss function must be provided"
-
-        if cfg.height_pred_after_roi_pool:
-            resolution = model.roi_heads.box_roi_pool.output_size[0]
-            out_channels = model.backbone.out_channels
-            building_height_pred_instance = cfg.building_height_pred_class(
-                out_channels * resolution**2
-            )
-        else:
-            building_height_pred_instance = cfg.building_height_pred_class(in_features)
-
     # Replace the pre-trained head with a new one
     box_predictor = FastRCNNPredictor(in_features, cfg.num_classes)
 
@@ -123,9 +109,21 @@ def new_model(cfg: ModelConfig):
         in_features_mask, cfg.mask_hidden_layer_size, cfg.num_classes
     )
 
+    # Create a new regression head to predict building height
+    building_height_pred_head = new_height_prediction_head(
+        model,
+        cfg.building_height_pred_class,
+        cfg.height_pred_after_roi_pool,
+    )
+
+    if building_height_pred_head is not None:
+        assert (
+            cfg.buildig_height_pred_loss_fn is not None
+        ), "Loss function must be provided"
+
     # Copy all of the params passed to a default RoIHeads
     model.roi_heads = CustomRoIHeads(
-        building_height_pred_instance,
+        building_height_pred_head,
         cfg.building_height_pred_loss_fn,
         cfg.height_pred_after_roi_pool,
         cfg.sample_equal,  # Sample equal number of positive and negative examples for height regression
@@ -152,8 +150,89 @@ def new_model(cfg: ModelConfig):
     return model
 
 
+def new_height_prediction_head(
+    model: nn.Module,
+    height_pred_class: Type | None,
+    pred_after_roi_pool: bool,
+) -> nn.Module | None:
+    if height_pred_class is None:
+        return None
+
+    # Add a new regression head to predict building height
+    if pred_after_roi_pool:
+        resolution = model.roi_heads.box_roi_pool.output_size[0]
+        out_channels = model.backbone.out_channels
+        return height_pred_class(out_channels * resolution**2)
+
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+
+    return height_pred_class(in_features)
+
+
+def set_height_prediction_head(
+    model: nn.Module,
+    height_pred_class: Type,
+    height_pred_loss_fn: Type,
+    height_pred_after_roi_pool: bool,
+    sample_equal: bool,
+):
+    assert isinstance(model.roi_heads, CustomRoIHeads), "Model must be CustomRoIHeads"
+    assert height_pred_loss_fn is not None, "Loss function must be provided"
+
+    model.roi_heads.building_height_pred_head = new_height_prediction_head(
+        model,
+        height_pred_class,
+        height_pred_after_roi_pool,
+    )
+    model.roi_heads.loss_fn = height_pred_loss_fn
+    model.roi_heads.height_pred_after_roi_pool = height_pred_after_roi_pool
+    model.roi_heads.sample_equal = sample_equal
+
+
+def new_pretrained_model(
+    new_model_name: str,
+    pretrained_checkpoint_path: str,
+    # height pred params
+    height_pred_class: Type,
+    height_pred_loss_fn: Type,
+    height_pred_after_roi_pool: bool = False,
+    sample_equal: bool = False,
+    # torch load params
+    strict: bool = True,
+    **load_kwargs,
+) -> nn.Module:
+    """Load a pretrained instance segmentation model from a checkpoint file and set height prediction head."""
+
+    checkpoint_dict = torch.load(pretrained_checkpoint_path, **load_kwargs)
+
+    model_cfg = ModelConfig(name=new_model_name)
+
+    if checkpoint_dict.get("hyperparameters") is not None:
+        loaded_model_cfg = checkpoint_dict["hyperparameters"]["model_cfg"]
+        logging.info(f"Loaded model config: {loaded_model_cfg}")
+        model_cfg.num_classes = loaded_model_cfg.num_classes
+        model_cfg.mask_hidden_layer_size = loaded_model_cfg.mask_hidden_layer_size
+
+    model = new_model(model_cfg)
+
+    model.load_state_dict(checkpoint_dict["model_state_dict"], strict=strict)
+
+    set_height_prediction_head(
+        model,
+        height_pred_class,
+        height_pred_loss_fn,
+        height_pred_after_roi_pool,
+        sample_equal,
+    )
+
+    return model
+
+
 class Checkpoint:
-    def __init__(self, root_dir: Path, model_name: str) -> None:
+    def __init__(self, root_dir: str | Path, model_name: str) -> None:
+        if isinstance(root_dir, str):
+            root_dir = Path(root_dir)
+
         self.root_dir = root_dir
         self.model_name = model_name
 
@@ -162,14 +241,27 @@ class Checkpoint:
 
         return torch.load(checkpoint_path), checkpoint_path
 
-    def save(self, epoch: int, model, optimizer, lr_scheduler, latest_loss: float):
+    def save(
+        self,
+        model: nn.Module,
+        hyperparameters: dict,
+        epoch: int,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        loss_dict: dict,
+        loss_reduced: float,
+    ):
         torch.save(
             {
-                "epoch": epoch,
+                # State dicts
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "lr_scheduler_state_dict": lr_scheduler.state_dict(),
-                "loss": latest_loss,
+                # Other parameters
+                "hyperparameters": hyperparameters,
+                "epoch": epoch,
+                "loss_reduced": loss_reduced,
+                "loss": loss_dict,
             },
             self._file_name(epoch),
         )
@@ -207,11 +299,11 @@ class Checkpoint:
 
 
 def train(
+    model: nn.Module,
     data_loader: DataLoader,
     data_loader_test: DataLoader,
-    model_cfg: ModelConfig,
     num_epochs: int,
-    checkpoint_dir: Path,
+    checkpoint_dir: str | Path,
     checkpoint_prune_threshold: int,
     eval_iterations: int = 0,
     # Constructors
@@ -221,7 +313,6 @@ def train(
 ):
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    model = new_model(model_cfg)
     model.to(device)
 
     params = [p for p in model.parameters() if p.requires_grad]
@@ -242,25 +333,23 @@ def train(
         lr_scheduler = new_lr_scheduler(optimizer)
 
     start_epoch = 0
-
-    checkpoint = Checkpoint(checkpoint_dir, model_cfg.name)
-
+    checkpoint = Checkpoint(checkpoint_dir, model.config.name)
     try:
         checkpoint_dict, checkpoint_path = checkpoint.load_latest()
         model.load_state_dict(checkpoint_dict["model_state_dict"])
         optimizer.load_state_dict(checkpoint_dict["optimizer_state_dict"])
         lr_scheduler.load_state_dict(checkpoint_dict["lr_scheduler_state_dict"])
         start_epoch = checkpoint_dict["epoch"] + 1
-        loss = checkpoint_dict["loss"]
+        loss = checkpoint_dict["loss_reduced"]
         logging.info(
-            f"Loaded the {checkpoint_path} checkpoint, starting training at the {start_epoch} epoch with loss {loss}",
+            f"Loaded the {checkpoint_path} checkpoint, starting training at the {start_epoch} epoch with reduced loss {loss}",
         )
     except FileNotFoundError:
         logging.info("No checkpoint found, starting from scratch")
 
     for epoch in range(start_epoch, num_epochs):
         # Train for one epoch, printing every print_freq
-        _, latest_loss = train_one_epoch(
+        _, loss_reduced, loss_dict = train_one_epoch(
             model,
             optimizer,
             data_loader,
@@ -270,16 +359,32 @@ def train(
             print_freq=print_freq,
         )
 
-        # # Update the learning rate
+        # Update the learning rate
         lr_scheduler.step()
 
         # Evaluate on the test dataset
-        mean_iou = evaluate(model, data_loader_test, device, eval_iterations)
-        logging.info(f"Mean IoU: {mean_iou}")
+        if eval_iterations != 0:
+            mean_iou = evaluate(model, data_loader_test, "cpu", eval_iterations)
+            logging.info(f"Mean IoU: {mean_iou}")
+        else:
+            logging.info("No evaluation")
 
-        logging.debug(f"Saving model parameters on {epoch} with loss {latest_loss}")
+        logging.info(
+            f"Saving model parameters on the {epoch} epoch with loss {loss_reduced}"
+        )
 
-        checkpoint.save(epoch, model, optimizer, lr_scheduler, latest_loss)
+        parameters = {
+            "model_cfg": model.config,
+        }
+        checkpoint.save(
+            model,
+            parameters,
+            epoch,
+            optimizer,
+            lr_scheduler,
+            loss_dict,
+            loss_reduced,
+        )
         checkpoint.prune_old(checkpoint_prune_threshold)
 
 
@@ -320,7 +425,7 @@ def evaluate(
     model: nn.Module,
     data_loader: DataLoader,
     device: torch.device,
-    eval_iterations: int = 0,
+    eval_iterations: int,
 ) -> float:
     """
     Evaluate a segmentation model.
@@ -334,11 +439,9 @@ def evaluate(
     total_iou = 0
     num_samples = 0
 
-    if eval_iterations == 0:
-        eval_iterations = len(data_loader)
-
+    data_lodaer_iter = iter(data_loader)
     for _ in range(eval_iterations):
-        images, targets = next(iter(data_loader))
+        images, targets = next(data_lodaer_iter)
 
         images = [image.to(device) for image in images]
         targets = [
@@ -408,27 +511,61 @@ def test_predict(
 
 
 if __name__ == "__main__":
+    # data_loader, data_loader_test = data_loaders(
+    #     "datasets/miyazaki/jpn",
+    #     dataset_cls=MiyazakiDataset,
+    #     train_batch_size=2,
+    #     test_batch_size=1,
+    #     test_split=0.2,
+    #     num_workers=4,
+    # )
+
+    # model_cfg = ModelConfig(
+    #     name="pretrained_seg_miyazaki_jpn",
+    #     num_classes=NUMBER_OF_CLASSES,
+    #     mask_hidden_layer_size=256,
+    #     building_height_pred_class=None,
+    # )
+
+    # train(
+    #     data_loader,
+    #     data_loader_test,
+    #     model_cfg=model_cfg,
+    #     num_epochs=10,
+    #     eval_iterations=1,
+    #     checkpoint_dir=Path("checkpoints"),
+    #     checkpoint_prune_threshold=3,
+    # )
+
+    model_cfg = ModelConfig(
+        name="inf_model",
+        num_classes=NUMBER_OF_CLASSES,
+        mask_hidden_layer_size=256,
+        building_height_pred_class=TwoMLPRegression,
+        building_height_pred_loss_fn=SmoothL1Loss(),
+    )
+
+    model = new_model(model_cfg)
+
+    checkpoint_dict = torch.load(
+        "checkpoints/pretrained_seg_miyazaki_epoch_9.pt", map_location="cpu"
+    )
+    model.load_state_dict(checkpoint_dict["model_state_dict"], strict=False)
+
     data_loader, data_loader_test = data_loaders(
-        "datasets/miyazaki/jpn",
-        dataset_cls=MiyazakiDataset,
+        "datasets/mlc_training_data/images_annotated",
+        dataset_cls=BuildingDataset,
         train_batch_size=2,
         test_batch_size=1,
         test_split=0.2,
         num_workers=4,
     )
 
-    model_cfg = ModelConfig(
-        name="pretrained_seg_miyazaki_jpn",
-        num_classes=NUMBER_OF_CLASSES,
-        mask_hidden_layer_size=256,
-        building_height_pred_class=None,
-    )
-
-    train(
-        data_loader,
-        data_loader_test,
-        model_cfg=model_cfg,
-        num_epochs=10,
-        checkpoint_dir=Path("checkpoints"),
-        checkpoint_prune_threshold=3,
+    print(
+        test_predict(
+            model_cfg,
+            "checkpoints/default_model_epoch_1.pt",
+            data_loader=data_loader_test,
+            # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
+        )
     )
