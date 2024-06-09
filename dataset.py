@@ -263,12 +263,53 @@ class MiyazakiDataset(Dataset):
             return self.__getitem__(idx)
 
 
-def get_transform(train: bool) -> T.Transform:
+def get_simple_transform(train: bool) -> T.Compose:
     transforms = []
+
+    transforms.append(T.ToDtype(torch.float, scale=True))
+
     if train:
         transforms.append(T.RandomHorizontalFlip(0.5))
-    # TODO: find out what scale does
+
+    transforms.append(T.ToPureTensor())
+
+    return T.Compose(transforms)
+
+
+def get_transform(train: bool) -> T.Compose:
+    transforms = []
+
     transforms.append(T.ToDtype(torch.float, scale=True))
+
+    if train:
+        # Horizontal flip
+        transforms.append(T.RandomHorizontalFlip(0.5))
+
+        # Vertical flip
+        transforms.append(T.RandomVerticalFlip(0.5))
+
+        # Random rotation
+        transforms.append(T.RandomRotation(degrees=15))
+
+        # Random crop and resize
+        transforms.append(T.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0)))
+
+        # Color jitter
+        transforms.append(
+            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2)
+        )
+
+        # Random grayscale
+        transforms.append(T.RandomGrayscale(p=0.2))
+
+        # Gaussian noise
+        transforms.append(T.Lambda(lambda img: img + torch.randn_like(img) * 0.1))
+
+    # Normalize
+    transforms.append(
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    )
+
     transforms.append(T.ToPureTensor())
 
     return T.Compose(transforms)
@@ -277,6 +318,7 @@ def get_transform(train: bool) -> T.Transform:
 def data_loaders(
     dataset_root: str,
     dataset_cls: Type,
+    get_transform: Callable = get_transform,
     train_batch_size: int = 2,
     test_batch_size: int = 1,
     test_split: float = 0.2,
@@ -287,12 +329,12 @@ def data_loaders(
     """
     dataset = dataset_cls(
         dataset_root,
-        transforms=get_transform(train=True),
+        transforms=get_simple_transform(train=True),
     )
 
     dataset_test = dataset_cls(
         dataset_root,
-        transforms=get_transform(train=False),
+        transforms=get_simple_transform(train=False),
     )
 
     # Split the dataset in train and test set.

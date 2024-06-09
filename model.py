@@ -7,7 +7,12 @@ import torch.nn.functional as F
 import logging
 import re
 from pathlib import Path
-from dataset import NUMBER_OF_CLASSES, BuildingDataset, data_loaders
+from dataset import (
+    NUMBER_OF_CLASSES,
+    BuildingDataset,
+    data_loaders,
+    show_segmentation_v2,
+)
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import (
     MaskRCNNPredictor,
@@ -85,6 +90,8 @@ class ModelConfig:
     name: str = "default_model"
     num_classes: int = NUMBER_OF_CLASSES
     mask_hidden_layer_size: int = 256
+    #  ["layer4", "layer3", "layer2", "layer1", "conv1"][:trainable_backbone_layers])
+    trainable_backbone_layers: int = 3
     building_height_pred_class: Optional[Type] = None
     building_height_pred_loss_fn: Optional[Callable] = None
     height_pred_after_roi_pool: bool = False
@@ -93,7 +100,10 @@ class ModelConfig:
 
 def new_model(cfg: ModelConfig) -> nn.Module:
     # Load an instance segmentation model pre-trained on COCO
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+        weights="DEFAULT", trainable_backbone_layers=cfg.trainable_backbone_layers
+    )
     model.config = cfg
 
     # Get number of input features for the classifier.
@@ -118,7 +128,7 @@ def new_model(cfg: ModelConfig) -> nn.Module:
 
     if building_height_pred_head is not None:
         assert (
-            cfg.buildig_height_pred_loss_fn is not None
+            cfg.building_height_pred_loss_fn is not None
         ), "Loss function must be provided"
 
     # Copy all of the params passed to a default RoIHeads
@@ -179,14 +189,23 @@ def set_height_prediction_head(
     assert isinstance(model.roi_heads, CustomRoIHeads), "Model must be CustomRoIHeads"
     assert height_pred_loss_fn is not None, "Loss function must be provided"
 
-    model.roi_heads.building_height_pred_head = new_height_prediction_head(
+    height_predictor = new_height_prediction_head(
         model,
         height_pred_class,
         height_pred_after_roi_pool,
     )
-    model.roi_heads.loss_fn = height_pred_loss_fn
-    model.roi_heads.height_pred_after_roi_pool = height_pred_after_roi_pool
-    model.roi_heads.sample_equal = sample_equal
+
+    model.roi_heads.set_parameters(
+        height_predictor,
+        height_pred_loss_fn,
+        height_pred_after_roi_pool,
+        sample_equal,
+    )
+
+    model.config.building_height_pred_class = height_pred_class
+    model.config.building_height_pred_loss_fn = height_pred_loss_fn
+    model.config.height_pred_after_roi_pool = height_pred_after_roi_pool
+    model.config.sample_equal = sample_equal
 
 
 def new_pretrained_model(
@@ -205,7 +224,10 @@ def new_pretrained_model(
 
     checkpoint_dict = torch.load(pretrained_checkpoint_path, **load_kwargs)
 
-    model_cfg = ModelConfig(name=new_model_name)
+    model_cfg = ModelConfig(
+        name=new_model_name,
+        trainable_backbone_layers=0,  # Freeze the entire ResNet encoder for fine-tuning
+    )
 
     if checkpoint_dict.get("hyperparameters") is not None:
         loaded_model_cfg = checkpoint_dict["hyperparameters"]["model_cfg"]
@@ -225,7 +247,111 @@ def new_pretrained_model(
         sample_equal,
     )
 
+    model.config.building_height_pred_class = height_pred_class
+    model.config.building_height_pred_loss_fn = height_pred_loss_fn
+    model.config.height_pred_after_roi_pool = height_pred_after_roi_pool
+    model.config.sample_equal = sample_equal
+
     return model
+
+
+def load_fine_tuned_model(checkpoint_path: str):
+    model = new_model(ModelConfig())
+
+    checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(checkpoint_dict["model_state_dict"], strict=False)
+
+    loaded_model_cfg = checkpoint_dict["hyperparameters"]["model_cfg"]
+
+    assert loaded_model_cfg.num_classes == model.config.num_classes
+    assert (
+        loaded_model_cfg.mask_hidden_layer_size == model.config.mask_hidden_layer_size
+    )
+
+    set_height_prediction_head(
+        model,
+        loaded_model_cfg.building_height_pred_class,
+        loaded_model_cfg.building_height_pred_loss_fn,
+        loaded_model_cfg.height_pred_after_roi_pool,
+        loaded_model_cfg.sample_equal,
+    )
+
+    # TODO: rm
+    model.config.building_height_pred_class = EnhancedTwoMLPRegression
+
+    return model
+
+
+def show_prediction_results(
+    model,
+    inf_images,
+    inf_targets,
+    mask_threshold=0.7,
+    box_score_threshold=0.7,
+    font=None,
+    font_size=18,
+):
+    model.eval()
+    predictions = model(inf_images)
+
+    transform = T.Compose(
+        [
+            T.Lambda(lambda x: x * 255.0),  # Scale to [0, 255]
+            T.Lambda(lambda x: x.to(torch.uint8)),  # Convert to uint8
+        ]
+    )
+
+    for i, pred in enumerate(predictions):
+        img = transform(inf_images[i])
+
+        pred_scores = pred["scores"]
+        selected_ids = torch.where(pred_scores > box_score_threshold)[0]
+        pred_boxes = pred["boxes"][selected_ids].long()
+        pred_scores = pred_scores[selected_ids]
+        pred_masks = pred["masks"][selected_ids].squeeze(1)
+        # pred_masks = (pred["masks"] > mask_threshold).squeeze(1)
+        pred_masks = pred_masks > mask_threshold
+
+        if pred.get("heights") is not None:
+            pred_labels = pred["heights"][selected_ids]
+            pred_labels = [
+                f"height: {height:.1f} ({score:.3f})"
+                for height, score in zip(pred_labels, pred_scores)
+            ]
+        else:
+            pred_labels = pred["labels"][selected_ids]
+            pred_labels = [
+                f"building: {label:.1f} ({score:.3f})"
+                for label, score in zip(pred_labels, pred_scores)
+            ]
+
+        target_masks = inf_targets[i]["masks"]
+        target_boxes = inf_targets[i]["boxes"]
+        if pred.get("heights") is not None:
+            target_labels = [
+                f"height: {h.item()}" for h in inf_targets[i]["building_heights"]
+            ]
+        else:
+            target_labels = [f"building: {h.item()}" for h in inf_targets[i]["labels"]]
+
+        show_segmentation_v2(
+            img,
+            pred_masks,
+            target_masks,
+            pred_boxes,
+            target_boxes,
+            pred_labels=pred_labels,
+            target_labels=target_labels,
+            pred_title=f"Prediction with mask threshold {mask_threshold} and score threshold {box_score_threshold}",
+            pred_colors="white",
+            target_colors="white",
+            font=font,
+            font_size=font_size,
+            # font="/Library/Fonts/Arial Unicode.ttf",
+            # font_size=18,
+        )
+
+        return predictions
 
 
 class Checkpoint:
@@ -510,62 +636,44 @@ def test_predict(
     return model(img)
 
 
-if __name__ == "__main__":
-    # data_loader, data_loader_test = data_loaders(
-    #     "datasets/miyazaki/jpn",
-    #     dataset_cls=MiyazakiDataset,
-    #     train_batch_size=2,
-    #     test_batch_size=1,
-    #     test_split=0.2,
-    #     num_workers=4,
-    # )
-
-    # model_cfg = ModelConfig(
-    #     name="pretrained_seg_miyazaki_jpn",
-    #     num_classes=NUMBER_OF_CLASSES,
-    #     mask_hidden_layer_size=256,
-    #     building_height_pred_class=None,
-    # )
-
-    # train(
-    #     data_loader,
-    #     data_loader_test,
-    #     model_cfg=model_cfg,
-    #     num_epochs=10,
-    #     eval_iterations=1,
-    #     checkpoint_dir=Path("checkpoints"),
-    #     checkpoint_prune_threshold=3,
-    # )
-
-    model_cfg = ModelConfig(
-        name="inf_model",
-        num_classes=NUMBER_OF_CLASSES,
-        mask_hidden_layer_size=256,
-        building_height_pred_class=TwoMLPRegression,
-        building_height_pred_loss_fn=SmoothL1Loss(),
+def train_pretrained_model(model_name: str):
+    model = new_pretrained_model(
+        new_model_name=model_name,
+        pretrained_checkpoint_path="checkpoints/pretrained_seg_miyazaki_epoch_9.pt",
+        height_pred_class=EnhancedTwoMLPRegression,
+        height_pred_loss_fn=SmoothL1Loss(),
+        height_pred_after_roi_pool=False,
+        sample_equal=False,
+        map_location="cpu",
     )
-
-    model = new_model(model_cfg)
-
-    checkpoint_dict = torch.load(
-        "checkpoints/pretrained_seg_miyazaki_epoch_9.pt", map_location="cpu"
-    )
-    model.load_state_dict(checkpoint_dict["model_state_dict"], strict=False)
 
     data_loader, data_loader_test = data_loaders(
-        "datasets/mlc_training_data/images_annotated",
+        "datasets/images_annotated",
         dataset_cls=BuildingDataset,
-        train_batch_size=2,
+        train_batch_size=5,
         test_batch_size=1,
-        test_split=0.2,
-        num_workers=4,
+        test_split=0.9,
+        num_workers=8,
     )
 
-    print(
-        test_predict(
-            model_cfg,
-            "checkpoints/default_model_epoch_1.pt",
-            data_loader=data_loader_test,
-            # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
-        )
+    train(
+        model,
+        data_loader,
+        data_loader_test,
+        num_epochs=2,
+        eval_iterations=0,
+        checkpoint_dir="checkpoints",
+        checkpoint_prune_threshold=3,
     )
+
+
+if __name__ == "__main__":
+    train_pretrained_model("pretrained_model_v1")
+    # print(
+    #     test_predict(
+    #         model_cfg,
+    #         "checkpoints/default_model_epoch_1.pt",
+    #         data_loader=data_loader_test,
+    #         # "datasets/mlc_training_data/images_annotated/uqpgutrlld.png",
+    #     )
+    # )

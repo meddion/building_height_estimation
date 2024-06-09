@@ -77,10 +77,18 @@ class CustomRoIHeads(RoIHeads):
             keypoint_head,
             keypoint_predictor,
         )
-        self.height_pred_after_roi_pool = height_pred_after_roi_pool
+
+        self.set_parameters(
+            height_predictor, loss_fn, height_pred_after_roi_pool, sample_equal
+        )
+
+    def set_parameters(
+        self, height_predictor, loss_fn, height_pred_after_roi_pool, sample_equal
+    ):
         self.height_predictor = height_predictor
-        self.sample_equal = sample_equal
         self.loss_fn = loss_fn
+        self.height_pred_after_roi_pool = height_pred_after_roi_pool
+        self.sample_equal = sample_equal
 
     # Ensure equal number of building and not building samples
     def sample_buildings(self, building_indices, not_building_indices):
