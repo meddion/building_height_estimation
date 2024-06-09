@@ -6,12 +6,14 @@ import torch
 import torchvision.models.detection.mask_rcnn
 import utils
 from coco_eval import CocoEvaluator
+from typing import Dict, List
 from coco_utils import get_coco_api_from_dataset
+from torch import Tensor
 
 
 def train_one_epoch(
     model, optimizer, data_loader, device, epoch, num_epochs, print_freq, scaler=None
-) -> tuple[utils.MetricLogger, torch.float]:
+) -> tuple[utils.MetricLogger, List[float], List[Dict[str, Tensor]]]:
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -28,7 +30,9 @@ def train_one_epoch(
             optimizer, start_factor=warmup_factor, total_iters=warmup_iters
         )
 
-    loss_value = torch.finfo(torch.float).max
+    losses = []
+    loss_dicts = []
+
     for images, targets in metric_logger.log_every(data_loader, print_freq, header):
         images = list(image.to(device) for image in images)
         targets = [
@@ -40,13 +44,15 @@ def train_one_epoch(
         ]
         with torch.cuda.amp.autocast(enabled=scaler is not None):
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            loss_dicts.append(loss_dict)
+            loss = sum(loss for loss in loss_dict.values())
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
 
         loss_value = losses_reduced.item()
+        losses.append(loss_value)
 
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training")
@@ -55,11 +61,11 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         if scaler is not None:
-            scaler.scale(losses).backward()
+            scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            losses.backward()
+            loss.backward()
             optimizer.step()
 
         if lr_scheduler is not None:
@@ -68,7 +74,7 @@ def train_one_epoch(
         metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    return metric_logger, loss_value, loss_dict
+    return metric_logger, losses, loss_dicts
 
 
 def _get_iou_types(model):

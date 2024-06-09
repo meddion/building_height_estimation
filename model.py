@@ -473,9 +473,10 @@ def train(
     except FileNotFoundError:
         logging.info("No checkpoint found, starting from scratch")
 
+    epoch_losses = [], epoch_loss_dicts = []
     for epoch in range(start_epoch, num_epochs):
         # Train for one epoch, printing every print_freq
-        _, loss_reduced, loss_dict = train_one_epoch(
+        _, losses, loss_dicts = train_one_epoch(
             model,
             optimizer,
             data_loader,
@@ -484,6 +485,9 @@ def train(
             num_epochs,
             print_freq=print_freq,
         )
+
+        epoch_losses.append(losses)
+        epoch_loss_dicts.append(loss_dicts)
 
         # Update the learning rate
         lr_scheduler.step()
@@ -496,7 +500,7 @@ def train(
             logging.info("No evaluation")
 
         logging.info(
-            f"Saving model parameters on the {epoch} epoch with loss {loss_reduced}"
+            f"Saving model parameters on the {epoch} epoch with loss {losses[-1]}"
         )
 
         parameters = {
@@ -508,8 +512,8 @@ def train(
             epoch,
             optimizer,
             lr_scheduler,
-            loss_dict,
-            loss_reduced,
+            loss_dicts[-1],
+            losses[-1],
         )
         checkpoint.prune_old(checkpoint_prune_threshold)
 
@@ -660,7 +664,7 @@ def train_pretrained_model(model_name: str):
         model,
         data_loader,
         data_loader_test,
-        num_epochs=2,
+        num_epochs=3,
         eval_iterations=0,
         checkpoint_dir="checkpoints",
         checkpoint_prune_threshold=3,

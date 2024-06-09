@@ -303,7 +303,7 @@ def get_transform(train: bool) -> T.Compose:
         transforms.append(T.RandomGrayscale(p=0.2))
 
         # Gaussian noise
-        transforms.append(T.Lambda(lambda img: img + torch.randn_like(img) * 0.1))
+        # transforms.append(T.Lambda(lambda img: img + torch.randn_like(img) * 0.1))
 
     # Normalize
     transforms.append(
