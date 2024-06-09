@@ -318,7 +318,7 @@ def get_transform(train: bool) -> T.Compose:
 def data_loaders(
     dataset_root: str,
     dataset_cls: Type,
-    get_transform: Callable[[bool]] = get_simple_transform,
+    get_transform: Callable[[bool], None] = get_simple_transform,
     train_batch_size: int = 2,
     test_batch_size: int = 1,
     test_split: float = 0.2,
@@ -329,12 +329,12 @@ def data_loaders(
     """
     dataset = dataset_cls(
         dataset_root,
-        transforms=get_simple_transform(train=True),
+        transforms=get_transform(train=True),
     )
 
     dataset_test = dataset_cls(
         dataset_root,
-        transforms=get_simple_transform(train=False),
+        transforms=get_transform(train=False),
     )
 
     # Split the dataset in train and test set.
