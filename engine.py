@@ -6,14 +6,14 @@ import torch
 import torchvision.models.detection.mask_rcnn
 import utils
 from coco_eval import CocoEvaluator
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from coco_utils import get_coco_api_from_dataset
 from torch import Tensor
 
 
 def train_one_epoch(
     model, optimizer, data_loader, device, epoch, num_epochs, print_freq, scaler=None
-) -> tuple[utils.MetricLogger, List[float], List[Dict[str, Tensor]]]:
+) -> Tuple[utils.MetricLogger, List[float], List[Dict[str, Tensor]]]:
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))

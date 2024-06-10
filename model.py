@@ -1,6 +1,6 @@
 import torch.utils
 import os
-from typing import Callable, Tuple, Optional, Type
+from typing import Callable, Optional, Type, Dict, List, Tuple
 from torch import nn
 import torch.utils.data
 import torch.nn.functional as F
@@ -11,7 +11,7 @@ from dataset import (
     NUMBER_OF_CLASSES,
     BuildingDataset,
     data_loaders,
-    show_segmentation_v2,
+    show_segmentation_diffs,
 )
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import (
@@ -25,6 +25,7 @@ from torchvision.transforms import v2 as T
 import torch
 from sklearn.metrics import jaccard_score
 from engine import train_one_epoch
+from torchvision.models.detection.rpn import AnchorGenerator
 from torch.nn import SmoothL1Loss
 
 
@@ -100,9 +101,29 @@ class ModelConfig:
 
 def new_model(cfg: ModelConfig) -> nn.Module:
     # Load an instance segmentation model pre-trained on COCO
+    # anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
+    # anchor_sizes = ((4,), (8,), (16,), (32,), (64,), (128,))
+    anchor_sizes = (
+        (4,),
+        (8,),
+        (16,),
+        (32,),
+    )
+    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+
+    anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
 
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-        weights="DEFAULT", trainable_backbone_layers=cfg.trainable_backbone_layers
+        weights="DEFAULT",
+        trainable_backbone_layers=cfg.trainable_backbone_layers,
+        anchor_generator=anchor_generator,
+        rpn_pre_nms_top_n_train=2 * 2000,
+        rpn_pre_nms_top_n_test=2 * 1000,
+        rpn_post_nms_top_n_train=2 * 2000,
+        rpn_post_nms_top_n_test=2 * 1000,
+        rpn_batch_size_per_image=2 * 256,
+        box_batch_size_per_image=2 * 512,
+        box_detections_per_img=2 * 100,
     )
     model.config = cfg
 
@@ -144,13 +165,13 @@ def new_model(cfg: ModelConfig) -> nn.Module:
         # Faster R-CNN training
         fg_iou_thresh=0.5,
         bg_iou_thresh=0.5,
-        batch_size_per_image=512,  # Batch size of the RoI minibatch, per image
+        batch_size_per_image=2 * 512,  # Batch size of the RoI minibatch, per image
         positive_fraction=0.25,  # Fraction of RoI minibatch that is labeled as positive
         bbox_reg_weights=None,
         # Faster R-CNN inference
         score_thresh=0.05,
         nms_thresh=0.5,
-        detections_per_img=100,
+        detections_per_img=2 * 100,
         # Mask
         mask_head=model.roi_heads.mask_head,
         mask_predictor=mask_predictor,
@@ -334,7 +355,7 @@ def show_prediction_results(
         else:
             target_labels = [f"building: {h.item()}" for h in inf_targets[i]["labels"]]
 
-        show_segmentation_v2(
+        show_segmentation_diffs(
             img,
             pred_masks,
             target_masks,
@@ -436,7 +457,7 @@ def train(
     new_optimizer: Callable = None,
     new_lr_scheduler: Callable = None,
     print_freq: int = 10,
-):
+) -> Tuple[List[float], List[Dict[str, torch.Tensor]]]:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     model.to(device)
@@ -473,7 +494,8 @@ def train(
     except FileNotFoundError:
         logging.info("No checkpoint found, starting from scratch")
 
-    epoch_losses = [], epoch_loss_dicts = []
+    epoch_losses = []
+    epoch_loss_dicts = []
     for epoch in range(start_epoch, num_epochs):
         # Train for one epoch, printing every print_freq
         _, losses, loss_dicts = train_one_epoch(
@@ -516,6 +538,8 @@ def train(
             losses[-1],
         )
         checkpoint.prune_old(checkpoint_prune_threshold)
+
+    return epoch_losses, epoch_loss_dicts
 
 
 # TODO: impl proper evaluation
@@ -656,11 +680,11 @@ def train_pretrained_model(model_name: str):
         dataset_cls=BuildingDataset,
         train_batch_size=5,
         test_batch_size=1,
-        test_split=0.9,
-        num_workers=8,
+        test_split=0.95,
+        num_workers=4,
     )
 
-    train(
+    return train(
         model,
         data_loader,
         data_loader_test,
@@ -672,7 +696,20 @@ def train_pretrained_model(model_name: str):
 
 
 if __name__ == "__main__":
+    # og_data_loader, og_data_loader_test = data_loaders(
+    #     "datasets/images_annotated/",
+    #     dataset_cls=BuildingDataset,
+    #     get_transform=get_transform,
+    #     train_batch_size=13,
+    #     test_batch_size=3,
+    #     test_split=0.01,
+    #     num_workers=8,
+    # )
+    # og_data_loader_test_inf_iter = iter(og_data_loader_test)
+    # next(og_data_loader_test_inf_iter)
+
     train_pretrained_model("pretrained_model_v1")
+
     # print(
     #     test_predict(
     #         model_cfg,

@@ -14,10 +14,9 @@ import logging
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import torch.utils
-from typing import Tuple
+from typing import Tuple, Dict, List
 import torch.utils.data
-import utils
-from typing import Callable, List, Type
+from typing import Callable, Type
 import fnmatch
 from skimage.measure import label
 from torch import Tensor
@@ -77,12 +76,6 @@ class BuildingDataset(Dataset):
             masks = []
             with open(os.path.join(self.root_dir / (img_stem + ".json"))) as f:
                 annot = json.load(f)
-
-                # # TODO: rm
-                # if len(annot["shapes"]) > 100:
-                #     raise ValueError(
-                #         f"More then 100 buildings (got {len(annot['shapes'])}) in the image {self.image_names[idx]}"
-                #     )
 
                 for shape in annot["shapes"]:
                     mask = np.zeros(img[0, :, :].shape, dtype=np.uint8)
@@ -255,7 +248,8 @@ class MiyazakiDataset(Dataset):
 
         except Exception as e:
             logging.warn(
-                f"Got error while processing image {self.image_paths[idx]} (idx: {idx}): {e}. Deleting it from the image list and skipping it."
+                f"Got error while processing image {self.image_paths[idx]} (idx: {idx}): {e}."
+                "Deleting it from the image list and skipping it."
             )
             self.deleted_images.append(self.image_paths[idx])
             del self.image_paths[idx]
@@ -263,47 +257,28 @@ class MiyazakiDataset(Dataset):
             return self.__getitem__(idx)
 
 
-def get_simple_transform(train: bool) -> T.Compose:
-    transforms = []
-
-    transforms.append(T.ToDtype(torch.float, scale=True))
+def simple_img_transform(train: bool) -> T.Compose:
+    transforms = [
+        T.ToDtype(torch.float, scale=True),
+    ]
 
     if train:
         transforms.append(T.RandomHorizontalFlip(0.5))
+        transforms.append(T.RandomVerticalFlip(0.5))
 
     transforms.append(T.ToPureTensor())
 
     return T.Compose(transforms)
 
 
-def get_transform(train: bool) -> T.Compose:
-    transforms = []
-
-    transforms.append(T.ToDtype(torch.float, scale=True))
+def normalized_img_transform(train: bool) -> T.Compose:
+    transforms = [
+        T.ToDtype(torch.float, scale=True),
+    ]
 
     if train:
-        # Horizontal flip
         transforms.append(T.RandomHorizontalFlip(0.5))
-
-        # Vertical flip
         transforms.append(T.RandomVerticalFlip(0.5))
-
-        # Random rotation
-        transforms.append(T.RandomRotation(degrees=15))
-
-        # Random crop and resize
-        transforms.append(T.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0)))
-
-        # Color jitter
-        transforms.append(
-            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2)
-        )
-
-        # Random grayscale
-        transforms.append(T.RandomGrayscale(p=0.2))
-
-        # Gaussian noise
-        # transforms.append(T.Lambda(lambda img: img + torch.randn_like(img) * 0.1))
 
     # Normalize
     transforms.append(
@@ -318,7 +293,7 @@ def get_transform(train: bool) -> T.Compose:
 def data_loaders(
     dataset_root: str,
     dataset_cls: Type,
-    get_transform: Callable[[bool], None] = get_simple_transform,
+    transform_fn: Callable[[bool], None] = simple_img_transform,
     train_batch_size: int = 2,
     test_batch_size: int = 1,
     test_split: float = 0.2,
@@ -327,15 +302,8 @@ def data_loaders(
     """
     Returns training and test data loaders.
     """
-    dataset = dataset_cls(
-        dataset_root,
-        transforms=get_transform(train=True),
-    )
-
-    dataset_test = dataset_cls(
-        dataset_root,
-        transforms=get_transform(train=False),
-    )
+    dataset = dataset_cls(dataset_root, transforms=transform_fn(train=True))
+    dataset_test = dataset_cls(dataset_root, transforms=transform_fn(train=False))
 
     # Split the dataset in train and test set.
     indices = torch.randperm(len(dataset)).tolist()
@@ -343,9 +311,8 @@ def data_loaders(
     dataset = torch.utils.data.Subset(dataset, indices[:-test_split])
     dataset_test = torch.utils.data.Subset(dataset_test, indices[-test_split:])
 
-    logging.info(
-        f"Size of training set {len(dataset)}. Sise of test set: {len(dataset_test)}"
-    )
+    def collate_fn(batch):
+        return tuple(zip(*batch))
 
     # define training and validation data loaders
     data_loader = torch.utils.data.DataLoader(
@@ -353,7 +320,7 @@ def data_loaders(
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=utils.collate_fn,
+        collate_fn=collate_fn,
     )
 
     data_loader_test = torch.utils.data.DataLoader(
@@ -361,21 +328,28 @@ def data_loaders(
         batch_size=test_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=utils.collate_fn,
+        collate_fn=collate_fn,
+    )
+
+    logging.debug(
+        f"Size of training set {len(dataset)}. Sise of test set: {len(dataset_test)}"
     )
 
     return data_loader, data_loader_test
 
 
+def float_to_uint8_img_transform() -> T.Compose:
+    return T.Compose(
+        [
+            T.Lambda(lambda x: x * 255.0),  # Scale to [0, 255]
+            T.Lambda(lambda x: x.to(torch.uint8)),  # Convert to uint8
+        ]
+    )
+
+
 def show_segmentation(img, masks, boxes=None, labels=None, bcolors="red"):
     if img.dtype != torch.uint8:
-        transform = T.Compose(
-            [
-                T.Lambda(lambda x: x * 255.0),  # Scale to [0, 255]
-                T.Lambda(lambda x: x.to(torch.uint8)),  # Convert to uint8
-            ]
-        )
-        img = transform(img)
+        img = float_to_uint8_img_transform()(img)
 
     output_image = draw_segmentation_masks(img, masks.to(torch.bool), alpha=0.8)
     if boxes is not None:
@@ -385,7 +359,7 @@ def show_segmentation(img, masks, boxes=None, labels=None, bcolors="red"):
     plt.imshow(output_image.permute(1, 2, 0))
 
 
-def show_segmentation_v2(
+def show_segmentation_diffs(
     img,
     pred_masks,
     target_masks,
@@ -439,3 +413,36 @@ def show_segmentation_v2(
     axs[1].axis("off")
 
     plt.show()
+
+
+# Function to plot the training losses per epoch.
+def plot_epoch_losses(
+    epoch_losses: List[List[float]], epoch_loss_dicts: List[List[Dict[str, float]]]
+):
+    for epoch in range(len(epoch_losses)):
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.plot(epoch_losses[epoch], label="Total Loss")
+        plt.xlabel("Iterations")
+        plt.ylabel("Loss")
+        plt.title(f"Total Loss per Epoch {epoch}")
+        plt.legend()
+
+        # Plot detailed losses
+        plt.subplot(1, 2, 2)
+        key_losses = []
+        keys = epoch_loss_dicts[epoch][0].keys()
+        for key in keys:
+            key_losses = [
+                loss_dict[key].item() for loss_dict in epoch_loss_dicts[epoch]
+            ]
+
+            plt.plot(key_losses, label=key)
+
+        plt.xlabel("Iterations")
+        plt.ylabel("Loss")
+        plt.title("Detailed Loss Components per Epoch")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show()
